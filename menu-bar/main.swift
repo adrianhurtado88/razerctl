@@ -97,10 +97,20 @@ final class Store: ObservableObject {
             }
             DispatchQueue.main.async { [weak self] in
                 self?.status = dict
-                if let s = self, !s.seededBrightness,
-                   let v = Double(dict["kbd_brightness"] ?? "") {
-                    s.kbdBrightness = min(100, max(0, v / 2.55))
-                    s.seededBrightness = true
+                // Seed both brightness sliders from the devices' real
+                // values (0-255 -> 0-100%) on the first read. The mouse
+                // value comes from a per-zone read (led=all is refused
+                // for reads on the Basilisk V3) — see Store.refresh.
+                if let s = self, !s.seededBrightness {
+                    if let v = Double(dict["kbd_brightness"] ?? "") {
+                        s.kbdBrightness = min(100, max(0, v / 2.55))
+                    }
+                    if let v = Double(dict["mouse_brightness"] ?? "") {
+                        s.mouseBrightness = min(100, max(0, v / 2.55))
+                    }
+                    if dict["kbd_brightness"] != nil || dict["mouse_brightness"] != nil {
+                        s.seededBrightness = true
+                    }
                 }
                 NotificationCenter.default.post(
                     name: Notification.Name("razerctlStatusUpdated"), object: nil)

@@ -96,8 +96,8 @@ target/release/razerctl brightness 60        # + --led all|scroll|logo|backlight
   Static color ✓, Brightness ✓
 - Mouse: DPI stages + custom ✓, Polling rate ✓, Wave (txid 0x3F quirk
   fixed) ✓, Rainbow static per-zone (custom frame) ✓, Static ✓,
-  Brightness ✓ (firmware refuses brightness read-back; slider seeds
-  from the keyboard), Free-spin scroll toggle ✓
+  Brightness ✓ (read via per-zone LED — the Basilisk refuses
+  `led=all` for reads, only writes; both sliders seed from real values), Free-spin scroll toggle ✓
 - Widget: frozen build at `~/Applications/RazerCtl.app`, Developer ID
   signed, Input Monitoring granted (survives rebuilds), serial background
   command queue (no UI freezes), per-device menu sections, widget log at

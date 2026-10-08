@@ -324,6 +324,16 @@ pub fn get_brightness(txid: u8, led: u8) -> Report {
     r
 }
 
+/// Diagnostic: a brightness read with explicit class/cmd — used to probe
+/// which read-back variant a device actually accepts (extended 0x0F/0x84
+/// vs standard 0x03/0x83, per-LED ids).
+pub fn read_brightness_variant(txid: u8, class: u8, cmd: u8, led: u8) -> Report {
+    let mut r = Report::new(txid, class, cmd, 0x03);
+    r.set_arg(0, VARSTORE);
+    r.set_arg(1, led);
+    r
+}
+
 // ---------------------------------------------------------------------------
 // Per-zone ("custom frame") lighting — Basilisk V3: 1 row × 11 zones
 // ---------------------------------------------------------------------------

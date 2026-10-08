@@ -123,6 +123,7 @@ fn run(args: &[String]) -> Result<String, String> {
             match *cmd {
                 "info" => cmd_info(&handles),
                 "status" => cmd_status(&handles, &failures),
+                "brightread" => cmd_brightread(&handles),
                 "dpi" => cmd_dpi(&handles, rest),
                 "stages" => cmd_stages(&handles, rest),
                 "poll" => cmd_poll(&handles, rest),
@@ -210,6 +211,43 @@ fn cmd_info(handles: &[Handle]) -> Result<String, String> {
     Ok(out.trim_end().to_string())
 }
 
+/// Diagnostic: try every brightness read-back variant on every device and
+/// report which (if any) the firmware accepts. Hidden from USAGE.
+fn cmd_brightread(handles: &[Handle]) -> Result<String, String> {
+    let mut out = String::new();
+    for h in handles {
+        let p = h.profile();
+        for (class, cmd, kind) in [(0x0Fu8, 0x84u8, "extended"), (0x03, 0x83, "standard")] {
+            for (led, name) in [
+                (0x00u8, "all"),
+                (0x01, "scroll"),
+                (0x04, "logo"),
+                (0x05, "backlight"),
+            ] {
+                match h.execute(read_brightness_variant(p.txid, class, cmd, led)) {
+                    Ok(resp) => {
+                        let st = resp.status();
+                        let hex = resp.bytes[..9]
+                            .iter()
+                            .map(|b| format!("{b:02X}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        out.push_str(&format!(
+                            "{:<22} {} ({:02X}/{:02X}) led={:<9} status={:02X} args[2]={:3}  [{}]\n",
+                            p.name, kind, class, cmd, name, st, resp.arg(2), hex
+                        ));
+                    }
+                    Err(e) => out.push_str(&format!(
+                        "{:<22} {} led={:<9} ERR: {}\n",
+                        p.name, kind, name, e.0
+                    )),
+                }
+            }
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
 /// Machine-readable status for the menu-bar widget (key=value lines).
 /// Includes `keyboard_error=` / `mouse_error=` lines when a device is
 /// present but refuses communication, so the UI can show the reason.
@@ -273,8 +311,13 @@ fn cmd_status(handles: &[Handle], failures: &[String]) -> Result<String, String>
                         if resp.arg(1) == 1 { "free" } else { "tactile" }
                     ));
                 }
-                if let Ok(resp) = h.execute(get_brightness(p.txid, LED_ALL)) {
-                    out.push_str(&format!("brightness={}\n", resp.arg(2)));
+                // Read brightness via a per-zone LED: the Basilisk V3
+                // refuses `led=all` for READS (only writes accept it), but
+                // accepts per-zone reads. Since every brightness set writes
+                // all zones to the same value, any zone's value is the
+                // effective brightness.
+                if let Ok(resp) = h.execute(get_brightness(p.txid, LED_SCROLL_WHEEL)) {
+                    out.push_str(&format!("mouse_brightness={}\n", resp.arg(2)));
                 }
             }
         }
