@@ -37,6 +37,7 @@ a small profile addition — see [Development notes](docs/DEVNOTES.md).
 
 **The app**
 - Native SwiftUI panel with per-device sections
+- Product photos for known models, with stock device symbols when artwork is unavailable
 - All device I/O on a serial background queue — the UI never blocks
 - Self-updating: checks this repo's releases and installs them in one click
   (signature-verified; the macOS privacy grant survives updates)
