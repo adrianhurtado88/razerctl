@@ -16,7 +16,7 @@ echo "==> Rust core"
 
 echo "==> Swift menu-bar app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # NOTE: the core must be named `razerctl-core`, never `razerctl` — on the
 # case-insensitive macOS filesystem, `razerctl` and `RazerCtl` are the same
 # path, and the swiftc output below would silently overwrite the core.
@@ -25,6 +25,21 @@ GUI="$APP/Contents/MacOS/RazerCtl"
 cp target/release/razerctl "$CORE"
 cp menu-bar/Info.plist "$APP/Contents/Info.plist"
 swiftc -O -o "$GUI" menu-bar/main.swift
+
+echo "==> App icon"
+# Build the complete macOS icon set from the approved 1024px source.
+ICON_WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/razerctl-icon.XXXXXX")
+trap 'rm -rf "$ICON_WORK_DIR"' EXIT
+ICONSET="$ICON_WORK_DIR/RazerCtl.iconset"
+mkdir -p "$ICONSET"
+for ICON_SIZE in 16 32 128 256 512; do
+    sips -z "$ICON_SIZE" "$ICON_SIZE" menu-bar/Resources/AppIcon.png \
+        --out "$ICONSET/icon_${ICON_SIZE}x${ICON_SIZE}.png" >/dev/null
+    RETINA_SIZE=$((ICON_SIZE * 2))
+    sips -z "$RETINA_SIZE" "$RETINA_SIZE" menu-bar/Resources/AppIcon.png \
+        --out "$ICONSET/icon_${ICON_SIZE}x${ICON_SIZE}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/RazerCtl.icns"
 
 echo "==> Verifying bundle integrity"
 cmp -s target/release/razerctl "$CORE" || { echo "ERROR: core copy mismatch"; exit 1; }
