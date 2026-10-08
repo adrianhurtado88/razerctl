@@ -46,32 +46,42 @@ final class Store: ObservableObject {
     /// Set after a self-update: the new instance shows a green
     /// "Updated to vX.Y" confirmation banner.
     @Published var updateCompleted: String?
+    /// Transient result of a manual "Check for Updates…" — e.g.
+    /// "You're up to date (v1.2)". Auto-clears after a few seconds.
+    @Published var updateCheckNote: String?
     private var assetURL: URL?
     private let repo = "adrianhurtado88/razerctl"
 
     /// Check GitHub for a newer release. Throttled to one call per 10 min
     /// ( UserDefaults), re-checked at launch and popover open.
-    func checkForUpdates() {
+    func checkForUpdates(force: Bool = false) {
         let last = UserDefaults.standard.double(forKey: "lastUpdateCheck")
-        guard Date().timeIntervalSince1970 - last > 600 else { return }
+        guard force || Date().timeIntervalSince1970 - last > 600 else { return }
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
 
         var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("RazerCtl", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 10
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let self,
-                  let data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tag = obj["tag_name"] as? String else { return }
-            let latest = tag.replacingOccurrences(of: "v", with: "")
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
             DispatchQueue.main.async {
+                guard let self else { return }
+                // Manual checks deserve visible feedback either way.
+                guard let data,
+                      response != nil,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag = obj["tag_name"] as? String else {
+                    if force { self.showCheckNote("Update check failed — no network?") }
+                    return
+                }
+                let latest = tag.replacingOccurrences(of: "v", with: "")
                 guard Self.isNewer(latest, than: Self.appVersion) else {
                     self.latestVersion = nil
+                    if force { self.showCheckNote("You're up to date (v\(Self.appVersion))") }
                     return
                 }
                 self.latestVersion = latest
+                self.updateCheckNote = nil
                 if let assets = obj["assets"] as? [[String: Any]],
                    let urlStr = assets.compactMap({ $0["browser_download_url"] as? String })
                        .first(where: { $0.hasSuffix(".zip") }) {
@@ -79,6 +89,13 @@ final class Store: ObservableObject {
                 }
             }
         }.resume()
+    }
+
+    private func showCheckNote(_ text: String) {
+        updateCheckNote = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.updateCheckNote = nil
+        }
     }
 
     /// Numeric component compare: "1.1" > "1.0.1" etc.
@@ -396,6 +413,8 @@ struct ContentView: View {
                 let _ = v // shown once per session
             } else if store.latestVersion != nil {
                 UpdateBanner()
+            } else if store.updateCheckNote != nil {
+                CheckNote()
             }
             if !hasKeyboard && !hasMouse {
                 EmptyGroup()
@@ -481,9 +500,43 @@ private struct UpdatedBanner: View {
     }
 }
 
+// MARK: - Check-result note
+
+/// Transient feedback for "Check for Updates…": neutral hairline row,
+/// auto-clears after a few seconds.
+private struct CheckNote: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 14))
+                .foregroundStyle(.secondary)
+            Text(store.updateCheckNote ?? "")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+        .background(
+            RoundedRectangle(cornerRadius: Theme.groupRadius)
+                .fill(Theme.groupFill(colorScheme))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.groupRadius)
+                .stroke(Theme.separator(colorScheme), lineWidth: 1)
+        )
+        .environment(\.colorScheme, colorScheme)
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
+}
+
 // MARK: - Title bar
 
 private struct TitleBar: View {
+    @EnvironmentObject var store: Store
+
     var body: some View {
         HStack {
             Text("RazerCtl")
@@ -493,6 +546,8 @@ private struct TitleBar: View {
                 .foregroundStyle(.secondary)
             Spacer()
             Menu {
+                Button("Check for Updates…") { store.checkForUpdates(force: true) }
+                Divider()
                 Button("About RazerCtl") { Store.showAbout() }
                 Divider()
                 Button("Quit RazerCtl") { NSApp.terminate(nil) }
