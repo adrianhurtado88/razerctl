@@ -32,7 +32,7 @@ of these USB control profiles.
 
 **Basilisk V3**
 
-- DPI: onboard stage switching and custom values from 1 to 26,000
+- DPI: onboard stage switching and custom values from 100 to 26,000
 - Polling rate: 125 / 500 / 1000 Hz
 - Lighting: spectrum, wave, static color, off
 - Per-zone rainbow — 11 side-strip zones, each its own color
