@@ -9,12 +9,16 @@ python3 - <<'PY'
 import os
 from pathlib import Path
 source = Path('menu-bar/main.swift').read_text().split('// MARK: - App bootstrap')[0]
+source = Path('menu-bar/KeyboardShortcuts.swift').read_text() + '\n' + source
+source = Path('menu-bar/MouseButtons.swift').read_text() + '\n' + source
 source = source.replace(
     'URL(fileURLWithPath: "/tmp/razerctl-widget.log")',
     'URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("store.log")'
 )
 Path(os.environ['WIDGET_TEST_DIR'], 'main.swift').write_text(
     source + '\n' + Path('tests/widget-regression.swift').read_text()
+    + '\n' + Path('tests/shortcuts-regression.swift').read_text()
+    + '\n' + Path('tests/mouse-buttons-regression.swift').read_text()
 )
 PY
 swiftc -O -o "$WIDGET_TEST_DIR/widget-check" "$WIDGET_TEST_DIR/main.swift"

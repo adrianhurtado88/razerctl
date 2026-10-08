@@ -14,6 +14,27 @@ import AppKit
 
 final class Store: ObservableObject {
     @Published var status: [String: String] = [:]
+    let shortcuts = KeyboardShortcutsStore()
+    let mouseButtons = MouseButtonsStore()
+    private var shortcutsWindow: KeyboardShortcutsWindow?
+    private var mouseButtonsWindow: MouseButtonsWindow?
+
+    init() {
+        let keyboard = shortcuts
+        mouseButtons.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
+    }
+
+    func showKeyboardShortcuts() {
+        if shortcutsWindow == nil { shortcutsWindow = KeyboardShortcutsWindow(store: shortcuts) }
+        shortcuts.refreshAccess()
+        shortcutsWindow?.show()
+    }
+
+    func showMouseButtons() {
+        if mouseButtonsWindow == nil { mouseButtonsWindow = MouseButtonsWindow(store: mouseButtons) }
+        mouseButtons.refreshAccess()
+        mouseButtonsWindow?.show()
+    }
 
     // Local interaction state (the firmware can't read effects back).
     @Published var kbdEffect = "spectrum"
@@ -481,6 +502,8 @@ private struct TitleBar: View {
             Spacer()
             Menu {
                 Button("Check for Updates…") { store.checkForUpdates(force: true) }
+                Button("Keyboard Shortcuts…") { store.showKeyboardShortcuts() }
+                Button("Mouse Buttons…") { store.showMouseButtons() }
                 Divider()
                 Button("About RazerCtl") { Store.showAbout() }
                 Divider()
@@ -905,6 +928,7 @@ private struct KeyboardGroup: View {
                     ("spectrum", "Spectrum"), ("breath", "Breath"),
                     ("static", "Static"), ("none", "Off"),
                 ])
+                KeyboardShortcutsButton(shortcuts: store.shortcuts, openEditor: store.showKeyboardShortcuts)
             } else if let error = store.status["keyboard_error"] {
                 DeviceProblem(error: error)
             }
@@ -936,6 +960,7 @@ private struct MouseGroup: View {
                         ("spectrum", "Spectrum"), ("wave", "Wave"),
                         ("rainbow", "Rainbow"), ("static", "Static"), ("none", "Off"),
                     ])
+                    MouseButtonsButton(buttons: store.mouseButtons, openEditor: store.showMouseButtons)
                 } else if let error = store.status["mouse_error"] {
                     DeviceProblem(error: error)
                 }
@@ -1211,6 +1236,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         store.refresh()
         store.checkForUpdates()
+        store.shortcuts.start()
+        store.mouseButtons.start()
 
         // If this instance was just installed by a self-update, show the
         // confirmation and open the panel automatically.
@@ -1221,6 +1248,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.showPanel()
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        store.shortcuts.stop()
+        store.mouseButtons.stop()
     }
 
     /// Show the popover (used by the post-update confirmation).

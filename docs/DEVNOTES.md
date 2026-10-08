@@ -98,3 +98,62 @@ keyboard). CLI: `effect wave --dev mouse`, `effect breath --dev keyboard`,
 3. Optional polish: per-zone editor beyond the rainbow preset,
    device hot-plug refresh.
 
+## Keyboard shortcut customiser
+
+`menu-bar/KeyboardShortcuts.swift` contains the native editor, a local Codable
+rule model, Carbon global-hotkey registration, and a separate action runner.
+The menu-bar panel and More menu open the same retained editor window.
+Assignments persist in the app's UserDefaults; startup registers enabled
+assignments and shutdown unregisters them. No default assignments are installed.
+
+These are Mac-wide shortcuts, not USB firmware mappings or Ornata-only input.
+Only the selected combinations are registered; no general keyboard event tap or
+keystroke logging is used. Function keys and combinations with Command, Control
+or Option can trigger an action. Ordinary letters alone are rejected. Reserved
+system shortcuts and registration failures are displayed beside the assignment.
+
+Sending an output shortcut requires Accessibility. It waits up to three seconds
+for physical modifiers to be released and cancels if the active app changes.
+Edits, pause, recording and shutdown cancel pending output. App and HTTP(S)
+website actions use NSWorkspace. Output combinations cannot match any enabled
+assignment's trigger, preventing direct or indirect shortcut loops. Failed edits
+keep the old saved rule and attempt to restore its registration.
+
+Validation: `bash tests/check-widget.sh` passes the existing widget regressions
+and shortcut capture, validation, conflict rollback, loop prevention, pause,
+recording, disabling, dispatch, persistence and unreadable-data preservation
+checks with fake registration and execution. The test suite reserves no global
+shortcuts, posts no keystrokes and does not request permissions. Physical key
+handling, OS permission grants, native window interaction and app launching
+still require a user check; automated checks are not hardware verification.
+
+## Mouse button customiser
+
+`menu-bar/MouseButtons.swift` adds a separate editor, persisted mouse rules, and
+a CoreGraphics event tap restricted to `otherMouseDown`, `otherMouseUp` and
+`otherMouseDragged`. Rules reuse the keyboard shortcut action editor and runner.
+The tap starts only when an enabled assignment or button capture needs it and
+Accessibility is granted. It never subscribes to keyboard input, left/right
+clicks, pointer motion or scroll-wheel events. Assignments apply to all mice on
+this Mac while the app runs; no firmware mapping writes are performed.
+
+The pure router suppresses paired down/up events for assigned buttons and runs
+one action on release. Edits, recording, pause and deletion cancel pending
+actions while draining any already-consumed click's release. Unassigned input
+passes through, including a release whose down was passed through before an
+assignment was created. Button recording captures one extra button and consumes
+its click without invoking an action. Recording an output shortcut also suspends
+the keyboard customiser, so existing global shortcuts cannot fire during capture.
+
+No rules or permission prompts are installed by default. Permission failures,
+invalid saved rules and action errors are shown in the editor and main panel.
+Saved data that cannot be decoded is retained instead of silently overwritten.
+DPI, scroll-mode and tilt controls that do not report ordinary mouse-button
+events are outside this software path; their physical behavior is unverified.
+
+`bash tests/check-widget.sh` now also checks paired click routing, capture,
+pause/edit/delete while held, queued-action cancellation, output recording,
+permission/retry handling, validation and persistence with fake monitoring.
+It intercepts no real mouse events, posts no actions and writes no device state.
+The native window, permission grant and physical Basilisk buttons require a user
+check; passing these isolated checks does not verify those interactions.
