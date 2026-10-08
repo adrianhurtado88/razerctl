@@ -38,7 +38,7 @@ final class Store: ObservableObject {
 
     /// Embedded app version (bumped by publish.sh). Compared against the
     /// latest GitHub release tag.
-    static let appVersion = "1.0.1"
+    static let appVersion = "1.1"
 
     @Published var latestVersion: String?
     @Published var updating = false
