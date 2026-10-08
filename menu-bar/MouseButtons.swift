@@ -172,6 +172,7 @@ final class MouseButtonsStore: ObservableObject {
     private var started = false
     private var outputRecordingDepth = 0
     private var captureTimeout: DispatchWorkItem?
+    private var captureNeedsRetry = false
     private var accessTimer: Timer?
     private var generation = UUID()
     private let rulesKey = "mouseButtonRules.v1"
@@ -219,6 +220,7 @@ final class MouseButtonsStore: ObservableObject {
         started = false
         stopCheckingAccess()
         capturing = false
+        captureNeedsRetry = false
         captureTimeout?.cancel()
         runner.cancel()
         generation = UUID()
@@ -239,7 +241,11 @@ final class MouseButtonsStore: ObservableObject {
 
     func setOutputRecording(_ recording: Bool) {
         guard recording || outputRecordingDepth > 0 else { return }
-        if recording { capturing = false; captureTimeout?.cancel() }
+        if recording {
+            capturing = false
+            captureNeedsRetry = false
+            captureTimeout?.cancel()
+        }
         outputRecordingDepth += recording ? 1 : -1
         onKeyRecordingChanged?(recording)
         configure()
@@ -275,6 +281,10 @@ final class MouseButtonsStore: ObservableObject {
         monitoring = false
         accessibilityGranted = runner.accessibilityGranted
         if !accessibilityGranted { router.reset() }
+        if captureNeedsRetry && started && accessibilityGranted {
+            beginCapture()
+            return
+        }
         configure()
         if !accessibilityGranted {
             monitorError = "Accessibility is still unavailable to this copy of RazerCtl. If it is already enabled in System Settings, quit and reopen RazerCtl, then try again."
@@ -296,13 +306,19 @@ final class MouseButtonsStore: ObservableObject {
         }
         capturedButton = nil
         actionError = nil
+        captureNeedsRetry = false
         capturing = true
         configure()
         guard monitoring else {
             let issue = monitorError
             capturing = false
             configure()
-            monitorError = issue
+            if monitoring {
+                actionError = "Mouse button recording failed. \(issue ?? "Try recording again.")"
+            } else {
+                captureNeedsRetry = true
+                monitorError = issue
+            }
             return
         }
         let timeout = DispatchWorkItem { [weak self] in
@@ -319,6 +335,7 @@ final class MouseButtonsStore: ObservableObject {
         captureTimeout?.cancel()
         captureTimeout = nil
         capturing = false
+        captureNeedsRetry = false
         configure()
     }
 
@@ -391,6 +408,7 @@ final class MouseButtonsStore: ObservableObject {
     func save(_ rule: MouseButtonRule) throws {
         guard storageError == nil else { throw ShortcutFailure(storageError!) }
         try MouseButtonRule.validate(rule, among: rules)
+        captureNeedsRetry = false
         if let index = rules.firstIndex(where: { $0.id == rule.id }) { rules[index] = rule }
         else { rules.append(rule) }
         persist()
@@ -399,6 +417,7 @@ final class MouseButtonsStore: ObservableObject {
 
     func remove(_ id: UUID) {
         guard storageError == nil else { return }
+        captureNeedsRetry = false
         rules.removeAll { $0.id == id }
         persist()
         configure()

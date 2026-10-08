@@ -5,10 +5,13 @@ final class FakeMouseMonitor: MouseButtonMonitoring {
     var isRunning = false
     var starts = 0
     var failStart = false
+    var failNextStart = false
     var enableOnStart = true
     func start() throws {
         starts += 1
-        if failStart { throw ShortcutFailure("Mouse monitoring unavailable.") }
+        let shouldFail = failStart || failNextStart
+        failNextStart = false
+        if shouldFail { throw ShortcutFailure("Mouse monitoring unavailable.") }
         isRunning = enableOnStart
     }
     func stop() { isRunning = false }
@@ -255,10 +258,41 @@ captureFailureStore.start()
 captureFailureStore.beginCapture()
 check(!captureFailureStore.capturing && captureFailureStore.monitorError != nil,
       "A failed first recording must keep its error visible so the user can retry")
+let startsBeforeFailedCaptureRetry = captureFailureMonitor.starts
+captureFailureStore.retry()
+check(captureFailureMonitor.starts > startsBeforeFailedCaptureRetry
+      && !captureFailureStore.monitoring && captureFailureStore.monitorError != nil,
+      "Retry must attempt the failed recording and retain its error while start still fails")
 captureFailureMonitor.failStart = false
 captureFailureStore.retry()
+check(captureFailureStore.capturing && captureFailureStore.monitoring && captureFailureStore.monitorError == nil,
+      "Retry must resume the failed first recording without another Record click")
+captureFailureStore.cancelCapture()
+
+captureFailureMonitor.failStart = true
 captureFailureStore.beginCapture()
-check(captureFailureStore.capturing && captureFailureStore.monitoring)
+captureFailureStore.cancelCapture()
+captureFailureMonitor.failStart = false
+let startsBeforeCancelledCaptureRetry = captureFailureMonitor.starts
+captureFailureStore.retry()
+check(!captureFailureStore.capturing && captureFailureMonitor.starts == startsBeforeCancelledCaptureRetry,
+      "Cancelling a failed recording must clear its pending Retry")
+
+try captureFailureStore.save(mouseRule)
+captureFailureMonitor.stop()
+captureFailureMonitor.failNextStart = true
+captureFailureStore.beginCapture()
+check(!captureFailureStore.capturing && captureFailureStore.monitoring
+      && captureFailureStore.monitorError == nil && captureFailureStore.activeCount == 1,
+      "A failed recording must not hide successfully restored saved assignments")
+check(captureFailureStore.actionError != nil,
+      "A recording failure must remain visible separately from a healthy listener")
+check(captureFailureMonitor.input(3, .down) && captureFailureMonitor.input(3, .up))
+settleMouseActions()
+check(captureFailureRunner.performed == [mouseRule.assignment],
+      "Restored assignments must still execute after a transient recording failure")
+captureFailureStore.beginCapture()
+check(captureFailureStore.capturing && captureFailureStore.monitoring && captureFailureStore.actionError == nil)
 captureFailureStore.cancelCapture()
 captureFailureStore.startCheckingAccess()
 captureFailureStore.stop()
