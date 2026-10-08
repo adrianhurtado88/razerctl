@@ -1,65 +1,53 @@
-// RazerCtl menu-bar widget — a tiny native wrapper around the `razerctl`
-// Rust core. No Electron, no cloud, no login. Menu bar only (LSUIElement).
+// RazerCtl — native macOS menu-bar control panel for Razer peripherals.
+//
+// Popover UI (SwiftUI) + Rust core (`razerctl-core`, adjacent binary).
+// All device commands run on a serial background queue: the UI never
+// blocks and commands never overlap.
 
+import SwiftUI
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+// MARK: - Store
 
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    let menu = NSMenu()
-    var colorTarget = "all" // keyboard | mouse | all
+final class Store: ObservableObject {
+    @Published var status: [String: String] = [:]
 
-    func applicationDidFinishLaunching(_ note: Notification) {
-        if let button = statusItem.button {
-            if let img = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "Razer") {
-                button.image = img
-            } else {
-                button.title = "RZ"
-            }
-        }
-        menu.delegate = self
-        statusItem.menu = menu
+    // Local interaction state (the firmware can't read effects back).
+    @Published var kbdEffect = "spectrum"
+    @Published var mouseEffect = "spectrum"
+    @Published var kbdColor = Color(red: 1.00, green: 0.22, blue: 0.39)
+    @Published var mouseColor = Color(red: 0.20, green: 0.78, blue: 1.00)
+    @Published var kbdBrightness = 100.0
+    @Published var mouseBrightness = 75.0
 
-        let panel = NSColorPanel.shared
-        panel.setTarget(self)
-        panel.setAction(#selector(colorPicked(_:)))
-        panel.isContinuous = false // fire on release, not every drag tick
-        refreshStatus { [weak self] in
-            self?.rebuild()
-        }
-    }
+    private var seededBrightness = false
+    private var colorDebounces: [String: DispatchWorkItem] = [:]
 
-    // ------------------------------------------------------------------ core
+    /// Serial queue: one command at a time, never the main thread.
+    let commandQueue = DispatchQueue(label: "local.razerctl.widget.commands",
+                                     qos: .userInitiated)
 
-    /// URL of the Rust core shipped next to this app's executable.
-    ///
-    /// Named `razerctl-core` — NOT `razerctl` — because macOS's filesystem
-    /// is case-insensitive: `razerctl` and `RazerCtl` are the same path, and
-    /// bundling both under those names once caused the Swift binary to
-    /// overwrite the core, so every status call re-launched the whole app
-    /// (a fork bomb of menu-bar icons).
+    /// Every core call is logged here — ground truth from the GUI context.
+    static let logURL = URL(fileURLWithPath: "/tmp/razerctl-widget.log")
+
     var coreURL: URL? {
         let dir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let core = dir.appendingPathComponent("razerctl-core")
         return FileManager.default.isExecutableFile(atPath: core.path) ? core : nil
     }
 
-    /// Every core invocation is logged here — ground truth from inside the
-    /// GUI context (TCC privacy decisions differ from a terminal's).
-    static let logURL = URL(fileURLWithPath: "/tmp/razerctl-widget.log")
-
     @discardableResult
     func run(_ args: [String]) -> String {
         guard let core = coreURL else {
             log("CORE MISSING at expected path")
-            return "" // never spawn blind
+            return ""
         }
         let p = Process()
         p.executableURL = core
         p.arguments = args
         let outPipe = Pipe()
-        p.standardOutput = outPipe
         let errPipe = Pipe()
+        p.standardOutput = outPipe
         p.standardError = errPipe
         do {
             try p.run()
@@ -68,20 +56,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return ""
         }
         p.waitUntilExit()
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: outData, encoding: .utf8) ?? ""
-        let err = String(data: errData, encoding: .utf8) ?? ""
+        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         log("[exit \(p.terminationStatus)] \(args.joined(separator: " "))"
-            + (out.isEmpty ? "" : "\n  out: \(out.replacingOccurrences(of: "\n", with: " | "))")
-            + (err.isEmpty ? "" : "\n  err: \(err.replacingOccurrences(of: "\n", with: " | "))"))
+            + (out.isEmpty ? "" : "  out: " + out.replacingOccurrences(of: "\n", with: " | "))
+            + (err.isEmpty ? "" : "  err: " + err.replacingOccurrences(of: "\n", with: " | ")))
         return out + err
     }
 
     private func log(_ msg: String) {
         let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
         let line = "\(stamp)  \(msg)\n"
-        // FileHandle(forWritingTo:) fails if the file doesn't exist.
         if !FileManager.default.fileExists(atPath: Self.logURL.path) {
             FileManager.default.createFile(atPath: Self.logURL.path, contents: nil)
         }
@@ -92,25 +77,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    var lastStatus: [String: String] = [:]
-
-    /// ALL device commands go through this SERIAL background queue: never
-    /// the main thread (which would freeze the menu), and never more than
-    /// one at a time (concurrent core processes fight over the HID
-    /// devices and can wedge them).
-    let commandQueue = DispatchQueue(label: "local.razerctl.widget.commands",
-                                     qos: .userInitiated)
-
-    /// Enqueue a fire-and-forget device command.
-    func enqueue(_ args: [String]) {
+    /// Fire a device command, then refresh status.
+    func command(_ args: [String]) {
         commandQueue.async { [weak self] in
             _ = self?.run(args)
         }
+        refresh()
     }
 
-    /// Refresh the cached device status on the command queue; `completion`
-    /// runs on the main thread once the new status is cached.
-    func refreshStatus(completion: (() -> Void)? = nil) {
+    /// Read `status` off-main; results publish on the main thread.
+    func refresh() {
         commandQueue.async { [weak self] in
             guard let self else { return }
             let out = self.run(["status"])
@@ -120,292 +96,578 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if kv.count == 2 { dict[String(kv[0])] = String(kv[1]) }
             }
             DispatchQueue.main.async { [weak self] in
-                self?.lastStatus = dict
-                completion?()
+                self?.status = dict
+                if let s = self, !s.seededBrightness,
+                   let v = Double(dict["kbd_brightness"] ?? "") {
+                    s.kbdBrightness = min(100, max(0, v / 2.55))
+                    s.seededBrightness = true
+                }
+                NotificationCenter.default.post(
+                    name: Notification.Name("razerctlStatusUpdated"), object: nil)
             }
         }
     }
 
-    // ------------------------------------------------------------- menu ui
+    // MARK: Device actions
 
-    func rebuild() {
-        menu.removeAllItems()
-        let s = lastStatus
-        let hasMouse = s["mouse"] != nil
-        let hasKbd = s["keyboard"] != nil
-
-        if !hasMouse && !hasKbd {
-            let item = NSMenuItem(title: "No Razer devices found", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-            // If a device is present but refused communication, say why.
-            for (label, key) in [("Keyboard", "keyboard_error"), ("Mouse", "mouse_error")] {
-                if let err = s[key] {
-                    let it = NSMenuItem(title: "⚠ \(label): \(err)", action: nil, keyEquivalent: "")
-                    it.isEnabled = false
-                    menu.addItem(it)
-                }
-            }
-            menu.addItem(.separator())
+    func applyEffect(_ name: String, device: String) {
+        if name == "rainbow" {
+            command(["rainbow", "11"])
         } else {
-            // If one device is missing but present-and-errored, say why.
-            if !hasKbd, let err = s["keyboard_error"] {
-                let it = NSMenuItem(title: "⚠ Keyboard unavailable: \(err)", action: nil, keyEquivalent: "")
-                it.isEnabled = false
-                menu.addItem(it)
-            }
-            if !hasMouse, let err = s["mouse_error"] {
-                let it = NSMenuItem(title: "⚠ Mouse unavailable: \(err)", action: nil, keyEquivalent: "")
-                it.isEnabled = false
-                menu.addItem(it)
-            }
-            // ============================ KEYBOARD ============================
-            if hasKbd {
-                let head = NSMenuItem(title: "⌨︎ KEYBOARD — \(s["keyboard"]!)  (fw \(s["keyboard_fw"] ?? "?"))",
-                                      action: nil, keyEquivalent: "")
-                head.isEnabled = false
-                menu.addItem(head)
-
-                // Keyboard lighting: spectrum + breath + static + off.
-                // (No wave — the Ornata V3 X refuses it; verified on hardware.)
-                let kfx = NSMenu(title: "Keyboard lighting")
-                for (title, fx) in [
-                    ("Spectrum (rainbow)", "spectrum"),
-                    ("Breath (fade)", "breath"),
-                ] {
-                    let it = NSMenuItem(title: title, action: #selector(setEffect(_:)), keyEquivalent: "")
-                    it.target = self
-                    it.representedObject = "\(fx)|keyboard"
-                    kfx.addItem(it)
-                }
-                let kStatic = NSMenuItem(title: "Static color…", action: #selector(pickColorTargeted(_:)), keyEquivalent: "")
-                kStatic.target = self
-                kStatic.representedObject = "keyboard"
-                kfx.addItem(kStatic)
-                let kOff = NSMenuItem(title: "Off", action: #selector(setEffect(_:)), keyEquivalent: "")
-                kOff.target = self
-                kOff.representedObject = "none|keyboard"
-                kfx.addItem(kOff)
-                let kfxItem = NSMenuItem(title: "Lighting", action: nil, keyEquivalent: "")
-                kfxItem.submenu = kfx
-                menu.addItem(kfxItem)
-                menu.addItem(.separator())
-            }
-
-            // ============================== MOUSE ==============================
-            if hasMouse {
-                let head = NSMenuItem(title: "🖱 MOUSE — \(s["mouse"]!)  (fw \(s["mouse_fw"] ?? "?"))",
-                                      action: nil, keyEquivalent: "")
-                head.isEnabled = false
-                menu.addItem(head)
-                if let dpi = s["dpi"] {
-                    let info = NSMenuItem(title: "DPI \(dpi) × \(s["dpi_y"] ?? dpi) · \(s["poll"] ?? "?") Hz · \(s["scroll"] ?? "?") scroll",
-                                          action: nil, keyEquivalent: "")
-                    info.isEnabled = false
-                    menu.addItem(info)
-                }
-
-                // DPI picker
-                let dpiMenu = NSMenu(title: "DPI")
-                let stages = (s["stages"] ?? "400,800,1600,3200,6400").split(separator: ",").map(String.init)
-                for v in stages {
-                    let it = NSMenuItem(title: "\(v)", action: #selector(setDpi(_:)), keyEquivalent: "")
-                    it.target = self
-                    it.state = (v == s["dpi"] && v == s["dpi_y"]) ? .on : .off
-                    dpiMenu.addItem(it)
-                }
-                let custom = NSMenuItem(title: "Custom…", action: #selector(customDpi(_:)), keyEquivalent: "")
-                custom.target = self
-                dpiMenu.addItem(custom)
-                let dpiItem = NSMenuItem(title: "DPI", action: nil, keyEquivalent: "")
-                dpiItem.submenu = dpiMenu
-                menu.addItem(dpiItem)
-
-                // Polling rate
-                let pollMenu = NSMenu(title: "Polling rate")
-                for rate in ["125", "500", "1000"] {
-                    let it = NSMenuItem(title: "\(rate) Hz", action: #selector(setPoll(_:)), keyEquivalent: "")
-                    it.target = self
-                    it.state = (rate == s["poll"]) ? .on : .off
-                    pollMenu.addItem(it)
-                }
-                let pollItem = NSMenuItem(title: "Polling rate", action: nil, keyEquivalent: "")
-                pollItem.submenu = pollMenu
-                menu.addItem(pollItem)
-
-                // Mouse lighting: spectrum + wave + per-zone rainbow + static
-                // + off. (No breath — the Basilisk V3 refuses it.)
-                let mfx = NSMenu(title: "Mouse lighting")
-                for (title, fx) in [
-                    ("Spectrum (rainbow)", "spectrum"),
-                    ("Wave (animated)", "wave"),
-                ] {
-                    let it = NSMenuItem(title: title, action: #selector(setEffect(_:)), keyEquivalent: "")
-                    it.target = self
-                    it.representedObject = "\(fx)|mouse"
-                    mfx.addItem(it)
-                }
-                let rainbowIt = NSMenuItem(title: "Rainbow (static, per-zone)",
-                                           action: #selector(runRainbow(_:)), keyEquivalent: "")
-                rainbowIt.target = self
-                mfx.addItem(rainbowIt)
-                let mStatic = NSMenuItem(title: "Static color…", action: #selector(pickColorTargeted(_:)), keyEquivalent: "")
-                mStatic.target = self
-                mStatic.representedObject = "mouse"
-                mfx.addItem(mStatic)
-                let mOff = NSMenuItem(title: "Off", action: #selector(setEffect(_:)), keyEquivalent: "")
-                mOff.target = self
-                mOff.representedObject = "none|mouse"
-                mfx.addItem(mOff)
-                let mfxItem = NSMenuItem(title: "Lighting", action: nil, keyEquivalent: "")
-                mfxItem.submenu = mfx
-                menu.addItem(mfxItem)
-
-                // Scroll mode toggle
-                let scroll = NSMenuItem(title: "Free-spin scroll wheel",
-                                         action: #selector(toggleScroll(_:)), keyEquivalent: "")
-                scroll.target = self
-                scroll.state = (s["scroll"] == "free") ? .on : .off
-                menu.addItem(scroll)
-            }
-
-            menu.addItem(.separator())
-
-            // ===================== BOTH (shared) =====================
-            // Two-row view: label on top, slider beneath — nothing
-            // overlapping, nothing clipped outside the view bounds.
-            let sliderItem = NSMenuItem()
-            let view = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 56))
-            let label = NSTextField(labelWithString: "Brightness (both devices)")
-            label.frame = NSRect(x: 16, y: 36, width: 268, height: 14)
-            label.font = NSFont.menuBarFont(ofSize: 0)
-            view.addSubview(label)
-            // Start the slider at the real device brightness (0-255 ->
-            // 0-100%), preferring the mouse's value.
-            let raw255 = Double(s["brightness"] ?? "") ?? Double(s["kbd_brightness"] ?? "") ?? 191
-            let pct = min(100.0, max(0.0, raw255 / 2.55))
-            let slider = NSSlider(value: pct, minValue: 0, maxValue: 100, target: self, action: #selector(brightnessChanged(_:)))
-            slider.isContinuous = false // fire on release, not every drag tick
-            slider.frame = NSRect(x: 16, y: 8, width: 268, height: 20)
-            view.addSubview(slider)
-            sliderItem.view = view
-            menu.addItem(sliderItem)
-        }
-
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit RazerCtl", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
-    }
-
-    // -------------------------------------------------------------- actions
-
-    @objc func setDpi(_ sender: NSMenuItem) {
-        enqueue(["dpi", sender.title])
-        refreshSoon()
-    }
-
-    @objc func customDpi(_ sender: NSMenuItem) {
-        let alert = NSAlert()
-        alert.messageText = "Custom DPI"
-        alert.informativeText = "DPI for both axes (100 – 26000):"
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
-        field.placeholderString = "1800"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Apply")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            let v = field.intValue
-            if v >= 100 {
-                enqueue(["dpi", String(v)])
-                refreshSoon()
-            }
+            command(["effect", name, "--dev", device])
         }
     }
 
-    @objc func setPoll(_ sender: NSMenuItem) {
-        let rate = sender.title.split(separator: " ").first.map(String.init) ?? "500"
-        enqueue(["poll", rate])
-        refreshSoon()
+    func applyStatic(color: Color, device: String) {
+        // The native color picker fires continuously while dragging;
+        // debounce so the device gets the final color, not one per tick.
+        colorDebounces[device]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let ns = NSColor(color).usingColorSpace(.deviceRGB) ?? .white
+            let r = Int(round(ns.redComponent * 255))
+            let g = Int(round(ns.greenComponent * 255))
+            let b = Int(round(ns.blueComponent * 255))
+            self.command(["effect", "static",
+                          String(format: "%02X%02X%02X", r, g, b),
+                          "--dev", device])
+            if device == "keyboard" { self.kbdEffect = "static" }
+            else { self.mouseEffect = "static" }
+        }
+        colorDebounces[device] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
-    /// representedObject carries "effect|device" — e.g. "wave|mouse",
-    /// "breath|keyboard", "none|mouse". Applies the effect to ONE device,
-    /// so a keyboard-only effect never gets refused by the mouse and
-    /// vice versa.
-    @objc func setEffect(_ sender: NSMenuItem) {
-        let spec = sender.representedObject as? String ?? "spectrum|all"
-        let parts = spec.split(separator: "|").map(String.init)
-        let fx = parts.first ?? "spectrum"
-        let dev = parts.count > 1 ? parts[1] : nil
-        var args = ["effect", fx]
-        if let dev, dev != "all" { args += ["--dev", dev] }
-        enqueue(args)
-        refreshSoon()
+    func setBrightness(_ pct: Double, device: String) {
+        command(["brightness", String(Int(pct)), "--dev", device])
     }
 
-    @objc func pickColorTargeted(_ sender: NSMenuItem) {
-        colorTarget = sender.representedObject as? String ?? "all"
-        openColorPanel()
+    func setDpi(_ value: String) {
+        command(["dpi", value])
     }
 
-    /// Lighting → Rainbow (static, per-zone): `razerctl rainbow 11`.
-    @objc func runRainbow(_ sender: NSMenuItem) {
-        enqueue(["rainbow", "11"])
-        refreshSoon()
+    func setPoll(_ hz: String) {
+        command(["poll", hz])
     }
 
-    func openColorPanel() {
-        let panel = NSColorPanel.shared
-        panel.setTarget(self)
-        panel.setAction(#selector(colorPicked(_:)))
-        panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    func setScroll(free: Bool) {
+        command(["scroll", free ? "free" : "tactile"])
     }
+}
 
-    @objc func colorPicked(_ sender: Any?) {
-        guard let c = NSColorPanel.shared.color.usingColorSpace(.deviceRGB) else { return }
-        let r = Int(round(c.redComponent * 255))
-        let g = Int(round(c.greenComponent * 255))
-        let b = Int(round(c.blueComponent * 255))
-        let hex = String(format: "%02X%02X%02X", r, g, b)
-        switch colorTarget {
-        case "keyboard": enqueue(["effect", "static", hex, "--dev", "keyboard"])
-        case "mouse":   enqueue(["effect", "static", hex, "--dev", "mouse"])
-        default:        enqueue(["effect", "static", hex])
+// MARK: - Content View
+
+struct ContentView: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        // Fixed width; height is whatever the content needs (see
+        // AppDelegate: sizingStyle .preferredContentSize means the
+        // popover adopts this view's ideal height). No scroll: the
+        // whole panel always fits, regardless of which cards show.
+        VStack(spacing: 16) {
+            HeaderView()
+                .padding(.horizontal, 2)
+            if store.status["keyboard"] != nil || store.status["keyboard_error"] != nil {
+                KeyboardCard()
+            }
+            if store.status["mouse"] != nil || store.status["mouse_error"] != nil {
+                MouseCard()
+            }
+            if store.status["keyboard"] == nil && store.status["mouse"] == nil
+                && store.status["keyboard_error"] == nil && store.status["mouse_error"] == nil {
+                NotFoundCard()
+            }
+            FooterView()
+                .padding(.horizontal, 2)
+        }
+        .padding(16)
+        .frame(width: 380)
+    }
+}
+
+// MARK: - Header / Footer
+
+private struct HeaderView: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "keyboard")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("RazerCtl")
+                    .font(.system(size: 15, weight: .semibold))
+                Text("Local control · no Synapse")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Circle()
+                .fill((store.status["keyboard"] != nil && store.status["mouse"] != nil)
+                      ? Color.green : Color.orange)
+                .frame(width: 8, height: 8)
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
+private struct FooterView: View {
+    var body: some View {
+        HStack {
+            Text("v1.0")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Quit RazerCtl") {
+                NSApp.terminate(nil)
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
+private struct NotFoundCard: View {
+    var body: some View {
+        GroupBox {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text("No Razer devices detected — plug them in and reopen.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+// MARK: - Shared rows
+
+private struct EffectRow: View {
+    @EnvironmentObject var store: Store
+    let device: String
+    let effects: [(String, String)]   // (raw command, display name)
+
+    private let labelWidth: CGFloat = 92
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Effect")
+                .foregroundStyle(.secondary)
+                .frame(width: labelWidth, alignment: .leading)
+            Picker("Effect", selection: selectionBinding) {
+                ForEach(effects, id: \.0) { fx in
+                    Text(fx.1).tag(fx.0)
+                }
+            }
+            // Menu style: segmented pickers refuse to compress below their
+            // ideal width (4 long labels ~360pt) and overflow the card;
+            // menu pickers always fit the width they're given.
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity)
+            .lineLimit(1)
         }
     }
 
-    /// The slider is non-continuous (fires once, on release) and the
-    /// command runs on the serial background queue — dragging never
-    /// touches the main thread or the devices.
-    @objc func brightnessChanged(_ sender: NSSlider) {
-        enqueue(["brightness", String(Int(sender.intValue))])
+    private var selectionBinding: Binding<String> {
+        let device = device
+        let store = store
+        return Binding(
+            get: { device == "keyboard" ? store.kbdEffect : store.mouseEffect },
+            set: { raw in
+                if device == "keyboard" { store.kbdEffect = raw }
+                else { store.mouseEffect = raw }
+                store.applyEffect(raw, device: device)
+            }
+        )
+    }
+}
+
+private struct ColorRow: View {
+    @EnvironmentObject var store: Store
+    let device: String
+
+    private let labelWidth: CGFloat = 92
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Static color")
+                .foregroundStyle(.secondary)
+                .frame(width: labelWidth, alignment: .leading)
+            ColorPicker("", selection: colorBinding, supportsOpacity: false)
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+        }
     }
 
-    @objc func toggleScroll(_ sender: NSMenuItem) {
-        let next = (sender.state == .on) ? "tactile" : "free"
-        enqueue(["scroll", next])
-        refreshSoon()
+    private var colorBinding: Binding<Color> {
+        let device = device
+        let store = store
+        return Binding(
+            get: { device == "keyboard" ? store.kbdColor : store.mouseColor },
+            set: { store.applyStatic(color: $0, device: device) }
+        )
+    }
+}
+
+private struct BrightnessRow: View {
+    @EnvironmentObject var store: Store
+    let device: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Brightness")
+                .foregroundStyle(.secondary)
+                .frame(width: 92, alignment: .leading)
+            Slider(value: sliderValue, in: 0...100, step: 1, onEditingChanged: { editing in
+                if !editing { store.setBrightness(value, device: device) }
+            })
+            Text("\(Int(value))%")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .trailing)
+        }
     }
 
-    func refreshSoon() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.refreshStatus { [weak self] in
-                self?.rebuild()
+    private var value: Double {
+        device == "keyboard" ? store.kbdBrightness : store.mouseBrightness
+    }
+
+    private var sliderValue: Binding<Double> {
+        let device = device
+        let store = store
+        return Binding(
+            get: { device == "keyboard" ? store.kbdBrightness : store.mouseBrightness },
+            set: { v in
+                if device == "keyboard" { store.kbdBrightness = v }
+                else { store.mouseBrightness = v }
+            }
+        )
+    }
+}
+
+private struct DeviceCaption: View {
+    let name: String?
+    let fw: String?
+    let error: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(name ?? "Unavailable")
+                .font(.system(size: 13, weight: .semibold))
+            if let fw {
+                Text("fw \(fw)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let error {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help(error)
             }
         }
     }
 }
 
-extension AppDelegate: NSMenuDelegate {
-    /// Rebuilding while the menu is open/tracking tears down the submenus
-    /// the user is interacting with (they flash closed — reads as "can't
-    /// open keyboard settings"). So: never rebuild here. The menu is built
-    /// at launch and rebuilt only after actions (refreshSoon).
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === self.menu else { return }
-        if menu.items.isEmpty {
-            rebuild()
+// MARK: - Card components
+
+/// A macOS-style card: soft background, 14pt padding, roomy corners.
+private struct Card<Content: View>: View {
+    let title: LocalizedStringKey
+    let icon: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 10)
+            content
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+
+/// A labelled group of rows inside a card, separated by a divider.
+private struct CardSection: View {
+    let label: LocalizedStringKey
+    @ViewBuilder let content: AnyView
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .textCase(.uppercase)
+            content
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// Thin divider used between card sections.
+private struct CardDivider: View {
+    var body: some View {
+        Divider().padding(.vertical, 6)
+    }
+}
+
+// MARK: - Keyboard card
+
+private struct KeyboardCard: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        Card(title: "Keyboard", icon: "keyboard") {
+            VStack(alignment: .leading, spacing: 10) {
+                DeviceCaption(
+                    name: store.status["keyboard"],
+                    fw: store.status["keyboard_fw"],
+                    error: store.status["keyboard_error"]
+                )
+                if store.status["keyboard"] != nil {
+                    CardSection(label: "Lighting") {
+                        AnyView(
+                            VStack(spacing: 10) {
+                                EffectRow(device: "keyboard", effects: [
+                                    ("spectrum", "Spectrum"),
+                                    ("breath", "Breath"),
+                                    ("none", "Off"),
+                                ])
+                                ColorRow(device: "keyboard")
+                            }
+                        )
+                    }
+                    CardDivider()
+                    BrightnessRow(device: "keyboard")
+                } else if let err = store.status["keyboard_error"] {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Mouse card
+
+private struct MouseCard: View {
+    @EnvironmentObject var store: Store
+    @State private var customDpi = ""
+    @FocusState private var dpiFieldFocused: Bool
+
+    private var stages: [String] {
+        (store.status["stages"] ?? "400,800,1600,3200,6400")
+            .split(separator: ",").map(String.init)
+    }
+
+    private var dpiSelection: Binding<String> {
+        let stages = stages
+        let store = store
+        return Binding(
+            get: {
+                let dpi = store.status["dpi"] ?? ""
+                return stages.contains(dpi) ? dpi : "custom"
+            },
+            set: { raw in
+                if raw != "custom" { store.setDpi(raw) }
+            }
+        )
+    }
+
+    private var pollSelection: Binding<String> {
+        let store = store
+        return Binding(
+            get: { store.status["poll"] ?? "500" },
+            set: { store.setPoll($0) }
+        )
+    }
+
+    private var scrollBinding: Binding<Bool> {
+        let store = store
+        return Binding(
+            get: { store.status["scroll"] == "free" },
+            set: { store.setScroll(free: $0) }
+        )
+    }
+
+    var body: some View {
+        Card(title: "Mouse", icon: "computermouse") {
+            VStack(alignment: .leading, spacing: 10) {
+                DeviceCaption(
+                    name: store.status["mouse"],
+                    fw: store.status["mouse_fw"],
+                    error: store.status["mouse_error"]
+                )
+
+                if store.status["mouse"] != nil {
+                    // DPI
+                    CardSection(label: "Sensitivity") {
+                        AnyView(
+                            VStack(spacing: 8) {
+                                HStack(spacing: 12) {
+                                    Text("DPI").foregroundStyle(.secondary)
+                                        .frame(width: 92, alignment: .leading)
+                                    Picker("DPI", selection: dpiSelection) {
+                                        ForEach(stages, id: \.self) { Text($0).tag($0) }
+                                        Text("Custom").tag("custom")
+                                    }
+                                    .pickerStyle(.menu)
+                                    .frame(maxWidth: .infinity)
+                                }
+                                if dpiSelection.wrappedValue == "custom" {
+                                    HStack(spacing: 8) {
+                                        Spacer()
+                                        Text("Custom value:")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        TextField("e.g. 1800", text: $customDpi)
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 96)
+                                            .focused($dpiFieldFocused)
+                                            .onSubmit(applyCustomDpi)
+                                        Button("Apply", action: applyCustomDpi)
+                                            .controlSize(.small)
+                                    }
+                                }
+                                HStack(spacing: 12) {
+                                    Text("Polling").foregroundStyle(.secondary)
+                                        .frame(width: 92, alignment: .leading)
+                                    Picker("Polling rate", selection: pollSelection) {
+                                        Text("125").tag("125")
+                                        Text("500").tag("500")
+                                        Text("1000").tag("1000")
+                                    }
+                                    .pickerStyle(.segmented)
+                                    .frame(maxWidth: .infinity)
+                                }
+                                .help("Report rate in Hz — higher means snappier cursor.")
+                            }
+                        )
+                    }
+
+                    CardDivider()
+
+                    // Lighting
+                    CardSection(label: "Lighting") {
+                        AnyView(
+                            VStack(spacing: 10) {
+                                EffectRow(device: "mouse", effects: [
+                                    ("spectrum", "Spectrum"),
+                                    ("wave", "Wave"),
+                                    ("rainbow", "Rainbow"),
+                                    ("none", "Off"),
+                                ])
+                                ColorRow(device: "mouse")
+                            }
+                        )
+                    }
+
+                    CardDivider()
+
+                    BrightnessRow(device: "mouse")
+
+                    CardDivider()
+
+                    Toggle("Free-spin scroll wheel", isOn: scrollBinding)
+                } else if let err = store.status["mouse_error"] {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func applyCustomDpi() {
+        let v = customDpi.trimmingCharacters(in: .whitespaces)
+        guard Int(v) != nil else { return }
+        store.setDpi(v)
+        dpiFieldFocused = false
+    }
+}
+
+// MARK: - App bootstrap
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let store = Store()
+    private let popover = NSPopover()
+    private var statusItem: NSStatusItem?
+    private var hosting: NSHostingController<AnyView>?
+
+    /// Keep the popover sized to the SwiftUI content's ideal size.
+    /// Status loads asynchronously (~30 ms) after launch — the panel would
+    /// otherwise lock its size to the empty skeleton and CLIP the cards
+    /// once they appear ("sides cut out"). Re-sync on every status update.
+    private func syncSize() {
+        guard let hosting else { return }
+        popover.contentSize = hosting.preferredContentSize
+    }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            button.image = NSImage(systemSymbolName: "keyboard",
+                                   accessibilityDescription: "RazerCtl")
+            button.action = #selector(togglePopover)
+            button.target = self
+        }
+        statusItem = item
+
+        // .applicationDefined: stays open when focus moves elsewhere —
+        // .transient auto-dismisses on ANY focus change, which made the
+        // panel vanish the instant a screenshot tool (or any other app)
+        // took focus. Close via the menu-bar button, Esc, or clicking it
+        // again.
+        popover.behavior = .applicationDefined
+        popover.animates = true
+        let host = NSHostingController(
+            rootView: AnyView(ContentView().environmentObject(store))
+        )
+        // .preferredContentSize: the popover sizes itself to the SwiftUI
+        // content's ideal size — no fixed height, no scroll.
+        host.sizingOptions = .preferredContentSize
+        hosting = host
+        popover.contentViewController = host
+
+        // Resize whenever the status (and thus panel content) changes:
+        // cards appearing must grow the popover, never clip it.
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("razerctlStatusUpdated"),
+            object: nil, queue: .main) { [weak self] _ in
+            self?.syncSize()
+        }
+
+        store.refresh()
+    }
+
+    @objc private func togglePopover() {
+        if popover.isShown {
+            popover.performClose(nil)
+        } else if let button = statusItem?.button {
+            store.refresh()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // The fresh status lands a moment after show — grow to fit.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.syncSize()
+            }
         }
     }
 }
