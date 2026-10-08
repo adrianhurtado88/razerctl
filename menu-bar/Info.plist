@@ -24,5 +24,7 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>RazerCtl uses Bluetooth to detect connected Razer devices and change supported mouse settings.</string>
 </dict>
 </plist>

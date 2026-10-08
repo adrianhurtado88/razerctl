@@ -14,16 +14,11 @@ let stubURL = testDirectory.appendingPathComponent("razerctl-core")
 let stub = #"""
 #!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/commands.txt"
-if [ "$1" = status ]; then
-cat <<'STATUS'
-keyboard=Razer Ornata V3 X keyboard_fw=2.0
-mouse=Razer Basilisk V3 mouse_fw=1.2
-dpi=1800
-poll=500
-scroll=tactile
-kbd_brightness=255
-mouse_brightness=255
-STATUS
+if [ "$1" = inventory ] || [ "$1" = detect ]; then
+    cat "$(dirname "$0")/devices.json"
+elif [ -f "$(dirname "$0")/fail-command" ]; then
+    echo 'error: selected device is unavailable' >&2
+    exit 1
 fi
 """#
 try stub.write(to: stubURL, atomically: true, encoding: .utf8)
@@ -40,34 +35,127 @@ check(Store.parseStatus("mouse_error=Razer Basilisk V3: failed=not permitted\n")
 check(Store.parseStatus("not a status line\n").isEmpty)
 
 func settle(_ store: Store) {
-    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
-    store.commandQueue.sync {}
-    RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    for _ in 0..<3 {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+        store.commandQueue.sync {}
+    }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
 }
 func commands() -> [String] {
     (try? String(contentsOf: testDirectory.appendingPathComponent("commands.txt"), encoding: .utf8))?
-        .split(separator: "\n").map(String.init).filter { $0 != "status" } ?? []
+        .split(separator: "\n").map(String.init).filter { $0 != "status" && $0 != "detect" && $0 != "inventory" } ?? []
 }
 
-let actionStore = Store()
+func fixtureDevice(_ id: String, kind: String, name: String,
+                   effects: [String] = [], settings: [String: String] = [:],
+                   dpi: Int = 0, scroll: Bool = false, zones: Int = 0,
+                   supported: Bool = true, error: String? = nil) -> [String: Any] {
+    ["id": id, "kind": kind, "name": name, "usb_id": "1532:FFFF", "supported": supported,
+     "error": error as Any? ?? NSNull(), "settings": settings,
+     "capabilities": ["effects": effects, "brightness": settings["kbd_brightness"] != nil || settings["mouse_brightness"] != nil,
+                      "dpi_max": dpi, "dpi_stages": dpi > 0, "poll_rates": dpi > 0 ? [125, 500, 1000] : [],
+                      "scroll": scroll, "zones": zones]]
+}
+let keyboardFixture = fixtureDevice("kbd-1", kind: "keyboard", name: "Razer Ornata V3 X",
+    effects: ["spectrum", "breath", "static", "none"],
+    settings: ["keyboard": "Razer Ornata V3 X", "keyboard_fw": "2.0", "kbd_brightness": "255"])
+let mouseFixture = fixtureDevice("mouse-1", kind: "mouse", name: "Razer Basilisk V3",
+    effects: ["spectrum", "wave", "rainbow", "static", "none"],
+    settings: ["mouse": "Razer Basilisk V3", "mouse_fw": "1.2", "mouse_brightness": "255",
+               "dpi": "1800", "poll": "500", "scroll": "tactile"], dpi: 26000, scroll: true, zones: 11)
+let viperFixture = fixtureDevice("mouse-2", kind: "mouse", name: "Razer Viper V2 Pro",
+    settings: ["mouse": "Razer Viper V2 Pro", "dpi": "1600", "poll": "1000"], dpi: 30000)
+let unknownFixture = fixtureDevice("unknown-1", kind: "device", name: "New Razer Model", supported: false)
+func writeDevices(_ devices: [[String: Any]]) throws {
+    try JSONSerialization.data(withJSONObject: ["devices": devices], options: [.sortedKeys])
+        .write(to: testDirectory.appendingPathComponent("devices.json"), options: .atomic)
+}
+try writeDevices([keyboardFixture, mouseFixture, viperFixture, unknownFixture])
+let discoveryStore = Store()
+discoveryStore.startDetection()
+check(discoveryStore.isDetecting, "Startup should scan immediately")
+settle(discoveryStore)
+check(discoveryStore.deviceStores.count == 4)
+check(discoveryStore.hasDetected && !discoveryStore.isDetecting && discoveryStore.detectionError == nil)
+check(commands().isEmpty, "Detection must not change device settings")
+let actionStore = discoveryStore.deviceStores[0]
+let detectedMouseStore = discoveryStore.deviceStores[1]
+let viperStore = discoveryStore.deviceStores[2]
+let unknownStore = discoveryStore.deviceStores[3]
+check(actionStore.kbdBrightness == 100 && detectedMouseStore.mouseBrightness == 100)
+check(actionStore.kbdEffect.isEmpty, "Detection must not pretend to read the current effect")
+check(viperStore.capabilities.effects.isEmpty && !viperStore.capabilities.scroll)
+check(viperStore.capabilities.dpi_max == 30000)
+check(actionStore.shortcuts === discoveryStore.shortcuts && detectedMouseStore.mouseButtons === discoveryStore.mouseButtons,
+      "Device sections must share the app's existing shortcut and mouse assignment stores")
+check(!discoveryStore.deviceStores[3].detectedDevice!.supported)
 actionStore.applyEffect("static", device: "keyboard")
 settle(actionStore)
-check(commands() == ["effect static FF3863 --dev keyboard"])
+check(commands() == ["effect static FF3863 --dev keyboard --id kbd-1"])
 check(actionStore.kbdEffect == "static")
-actionStore.applyStatic(color: .red, device: "mouse")
-actionStore.applyStatic(color: .green, device: "mouse")
-actionStore.applyStatic(color: Color(red: 0, green: 0, blue: 1), device: "mouse")
-check(NSColor(actionStore.mouseColor).usingColorSpace(.deviceRGB)!.blueComponent == 1)
-settle(actionStore)
-check(commands().suffix(1) == ["effect static 0000FF --dev mouse"])
+detectedMouseStore.applyStatic(color: .red, device: "mouse")
+detectedMouseStore.applyStatic(color: .green, device: "mouse")
+detectedMouseStore.applyStatic(color: Color(red: 0, green: 0, blue: 1), device: "mouse")
+check(NSColor(detectedMouseStore.mouseColor).usingColorSpace(.deviceRGB)!.blueComponent == 1)
+settle(detectedMouseStore)
+check(commands().suffix(1) == ["effect static 0000FF --dev mouse --id mouse-1"])
 check(commands().count == 2, "Color dragging must debounce device writes")
 actionStore.setBrightness(37, device: "keyboard")
-actionStore.setDpi("1800")
-actionStore.setPoll("500")
-actionStore.setScroll(free: true)
+detectedMouseStore.setDpi("1800")
+detectedMouseStore.setPoll("500")
+detectedMouseStore.setScroll(free: true)
 settle(actionStore)
-check(commands().suffix(4) == ["brightness 37 --dev keyboard", "dpi 1800", "poll 500", "scroll free"])
-check(actionStore.status["dpi"] == "1800")
+check(commands().suffix(4) == ["brightness 37 --dev keyboard --id kbd-1", "dpi 1800 --id mouse-1", "poll 500 --id mouse-1", "scroll free --id mouse-1"])
+check(detectedMouseStore.status["dpi"] == "1800")
+viperStore.setDpi("30000")
+settle(viperStore)
+check(commands().last == "dpi 30000 --id mouse-2", "Second mouse must retain its exact target")
+check(discoveryStore.deviceStores[1] === detectedMouseStore, "Rescans should preserve local device interactions")
+check(detectedMouseStore.mouseEffect == "static")
+detectedMouseStore.applyEffect("rainbow", device: "mouse")
+settle(detectedMouseStore)
+check(commands().last == "rainbow 11 --id mouse-1")
+
+// A stable inventory does not cause repeated control reads.
+let commandsFile = testDirectory.appendingPathComponent("commands.txt")
+let beforeStableCheck = try String(contentsOf: commandsFile, encoding: .utf8).split(separator: "\n").filter { $0 == "detect" }.count
+discoveryStore.checkForDeviceChanges()
+settle(discoveryStore)
+let afterStableCheck = try String(contentsOf: commandsFile, encoding: .utf8).split(separator: "\n").filter { $0 == "detect" }.count
+check(afterStableCheck == beforeStableCheck)
+
+// Let the actual automatic timer notice a new device list.
+try writeDevices([keyboardFixture, viperFixture])
+RunLoop.main.run(until: Date().addingTimeInterval(3.2))
+settle(discoveryStore)
+check(discoveryStore.deviceStores.map(\.id) == ["kbd-1", "mouse-2"], "Automatic scan should notice disconnects")
+discoveryStore.stopDetection()
+try writeDevices([])
+discoveryStore.refresh()
+settle(discoveryStore)
+check(discoveryStore.deviceStores.isEmpty && discoveryStore.detectionError == nil)
+let denied = fixtureDevice("kbd-1", kind: "keyboard", name: "Razer Ornata V3 X",
+                          error: "HID open failed: not permitted")
+try writeDevices([denied, unknownFixture])
+discoveryStore.refresh()
+settle(discoveryStore)
+check(discoveryStore.deviceStores[0].status["keyboard_error"]!.contains("not permitted"))
+check(discoveryStore.deviceStores[0].status["keyboard"] == nil)
+check(discoveryStore.deviceStores.count == 2, "Unknown hardware must remain visible")
+try "bad JSON".write(to: testDirectory.appendingPathComponent("devices.json"), atomically: true, encoding: .utf8)
+discoveryStore.refresh()
+settle(discoveryStore)
+check(discoveryStore.detectionError != nil && discoveryStore.deviceStores.count == 2,
+      "Failed detection must keep the last inventory and surface an error")
+try writeDevices([mouseFixture])
+discoveryStore.refresh()
+settle(discoveryStore)
+let recoveredMouse = discoveryStore.deviceStores[0]
+try "".write(to: testDirectory.appendingPathComponent("fail-command"), atomically: true, encoding: .utf8)
+recoveredMouse.setDpi("800")
+settle(discoveryStore)
+check(recoveredMouse.commandError?.contains("unavailable") == true, "Command failures must be visible")
+try FileManager.default.removeItem(at: testDirectory.appendingPathComponent("fail-command"))
 
 func descendant<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
     if let match = view as? T { return match }
@@ -76,6 +164,28 @@ func descendant<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
     }
     return nil
 }
+private let unknownHost = NSHostingView(rootView: DetectedDeviceGroup(
+    deviceStore: unknownStore
+).environmentObject(unknownStore).frame(width: 324))
+unknownHost.layoutSubtreeIfNeeded()
+check(descendant(NSSlider.self, in: unknownHost) == nil)
+check(descendant(NSPopUpButton.self, in: unknownHost) == nil, "Unknown hardware must not offer setting writes")
+private let viperHost = NSHostingView(rootView: DetectedDeviceGroup(
+    deviceStore: viperStore
+).environmentObject(viperStore).frame(width: 324))
+viperHost.layoutSubtreeIfNeeded()
+check(descendant(NSSlider.self, in: viperHost) == nil)
+check(descendant(NSPopUpButton.self, in: viperHost) == nil, "A mouse without RGB must not show lighting")
+try writeDevices([keyboardFixture, mouseFixture, viperFixture, unknownFixture])
+discoveryStore.refresh()
+settle(discoveryStore)
+private let panelHost = NSHostingView(rootView: ContentView().environmentObject(discoveryStore))
+panelHost.setFrameSize(NSSize(width: 360, height: 800))
+panelHost.layoutSubtreeIfNeeded()
+RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+check(panelHost.fittingSize.width == 360)
+check(panelHost.fittingSize.height >= 550 && panelHost.fittingSize.height <= 800,
+      "Several devices need a visible, bounded scroll area")
 var sliderValue = 100.0
 var sliderCommits: [Double] = []
 private let sliderHost = NSHostingView(rootView: BrightnessSlider(
@@ -113,4 +223,4 @@ check(effectMenu.itemTitles == ["Spectrum", "Static", "Off"])
 effectMenu.selectItem(at: 1)
 effectMenu.sendAction(effectMenu.action, to: effectMenu.target)
 check(selectedEffect == "static")
-print("Passed: status metadata, static color arguments and debounce, device action dispatch, slider drag/commit, keyboard/AX commit, effect menu selection. No hardware accessed.")
+print("Passed: automatic/manual discovery, capability gates, multiple device targets, reconnects, empty/unknown/permission/failure states, static colors and debounce, device actions, slider/keyboard/AX commits, effect menus. No hardware accessed.")

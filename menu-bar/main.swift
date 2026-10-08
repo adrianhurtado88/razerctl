@@ -12,44 +12,104 @@ import AppKit
 
 // MARK: - Store
 
-final class Store: ObservableObject {
+struct DeviceCapabilities: Decodable {
+    var effects: [String] = []
+    var brightness = false
+    var dpi_max = 0
+    var dpi_stages = false
+    var poll_rates: [Int] = []
+    var scroll = false
+    var zones = 0
+
+    var hasPerformance: Bool { dpi_max > 0 || !poll_rates.isEmpty || scroll }
+    var lightingEffects: [(String, String)] {
+        effects.map { ($0, $0 == "none" ? "Off" : $0.capitalized) }
+    }
+}
+
+struct DetectedDevice: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let kind: String
+    let usb_id: String
+    let supported: Bool
+    let capabilities: DeviceCapabilities
+    let settings: [String: String]
+    let error: String?
+    var transport: String? = nil
+
+    var connectionLabel: String { transport == "bluetooth" ? "Bluetooth" : (transport == "unknown" ? "Connection unknown" : "USB") }
+}
+
+private struct DetectionResult: Decodable {
+    let devices: [DetectedDevice]
+}
+
+final class Store: ObservableObject, Identifiable {
     @Published var status: [String: String] = [:]
-    let shortcuts = KeyboardShortcutsStore()
-    let mouseButtons = MouseButtonsStore()
+    private lazy var ownShortcuts = KeyboardShortcutsStore()
+    private lazy var ownMouseButtons = MouseButtonsStore()
+    var shortcuts: KeyboardShortcutsStore { discoveryStore?.shortcuts ?? ownShortcuts }
+    var mouseButtons: MouseButtonsStore { discoveryStore?.mouseButtons ?? ownMouseButtons }
     private var shortcutsWindow: KeyboardShortcutsWindow?
     private var mouseButtonsWindow: MouseButtonsWindow?
 
-    init() {
-        let keyboard = shortcuts
-        mouseButtons.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
+    @Published var deviceStores: [Store] = []
+    @Published var detectedDevice: DetectedDevice?
+    @Published var isDetecting = false
+    @Published var hasDetected = false
+    @Published var detectionError: String?
+    @Published var bluetoothError: String?
+    @Published var commandError: String?
+    private let targetID: String?
+    var id: String { targetID ?? "discovery" }
+    var capabilities: DeviceCapabilities { detectedDevice?.capabilities ?? DeviceCapabilities() }
+    var dpiMinimum: Int { detectedDevice?.transport == "bluetooth" ? 100 : 1 }
+    private weak var discoveryStore: Store?
+    private var detectionTimer: Timer?
+    private var inventorySignature: String?
+    private var inventoryChecking = false
+    private var scanPending = false
+    private let bluetooth: BluetoothBackend?
+
+    init(targetID: String? = nil, commandQueue: DispatchQueue? = nil, bluetooth: BluetoothBackend? = nil) {
+        self.targetID = targetID
+        self.bluetooth = bluetooth
+        self.commandQueue = commandQueue ?? DispatchQueue(label: "local.razerctl.widget.commands", qos: .userInitiated)
+        if targetID == nil {
+            let keyboard = shortcuts
+            mouseButtons.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
+        }
     }
 
+    deinit { detectionTimer?.invalidate() }
+
     func showKeyboardShortcuts() {
+        if let discoveryStore { discoveryStore.showKeyboardShortcuts(); return }
         if shortcutsWindow == nil { shortcutsWindow = KeyboardShortcutsWindow(store: shortcuts) }
         shortcuts.refreshAccess()
         shortcutsWindow?.show()
     }
 
     func showMouseButtons() {
+        if let discoveryStore { discoveryStore.showMouseButtons(); return }
         if mouseButtonsWindow == nil { mouseButtonsWindow = MouseButtonsWindow(store: mouseButtons) }
         mouseButtons.refreshAccess()
         mouseButtonsWindow?.show()
     }
 
     // Local interaction state (the firmware can't read effects back).
-    @Published var kbdEffect = "spectrum"
-    @Published var mouseEffect = "spectrum"
+    @Published var kbdEffect = ""
+    @Published var mouseEffect = ""
     @Published var kbdColor = Color(red: 1.00, green: 0.22, blue: 0.39)
     @Published var mouseColor = Color(red: 0.20, green: 0.78, blue: 1.00)
     @Published var kbdBrightness = 100.0
     @Published var mouseBrightness = 75.0
 
-    private var seededBrightness = false
     private var colorDebounces: [String: DispatchWorkItem] = [:]
 
     /// Serial queue: one command at a time, never the main thread.
-    let commandQueue = DispatchQueue(label: "local.razerctl.widget.commands",
-                                     qos: .userInitiated)
+    let commandQueue: DispatchQueue
 
     /// Every core call is logged here — ground truth from the GUI context.
     static let logURL = URL(fileURLWithPath: "/tmp/razerctl-widget.log")
@@ -251,30 +311,39 @@ final class Store: ObservableObject {
 
     @discardableResult
     func run(_ args: [String]) -> String {
+        runResult(args).output
+    }
+
+    private func runResult(_ args: [String]) -> (output: String, exitCode: Int32) {
+        if let targetID, targetID.hasPrefix("ble:") {
+            guard let bluetooth else { return ("The Bluetooth controller is unavailable.", -1) }
+            return bluetooth.command(args, id: targetID)
+        }
         guard let core = coreURL else {
             log("CORE MISSING at expected path")
-            return ""
+            return ("The device controller is missing. Reinstall RazerCtl.", -1)
         }
         let p = Process()
         p.executableURL = core
         p.arguments = args
         let outPipe = Pipe()
-        let errPipe = Pipe()
         p.standardOutput = outPipe
-        p.standardError = errPipe
+        p.standardError = outPipe
         do {
             try p.run()
         } catch {
             log("spawn failed (\(args.joined(separator: " "))): \(error)")
-            return ""
+            return ("Couldn't start the device controller: \(error.localizedDescription)", -1)
         }
-        p.waitUntilExit()
+        // Drain while the process runs: a large device inventory can fill
+        // the pipe buffer and otherwise deadlock waitUntilExit().
         let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        log("[exit \(p.terminationStatus)] \(args.joined(separator: " "))"
-            + (out.isEmpty ? "" : "  out: " + out.replacingOccurrences(of: "\n", with: " | "))
-            + (err.isEmpty ? "" : "  err: " + err.replacingOccurrences(of: "\n", with: " | ")))
-        return out + err
+        p.waitUntilExit()
+        if args.first != "inventory" {
+            log("[exit \(p.terminationStatus)] \(args.joined(separator: " "))"
+                + (out.isEmpty ? "" : "  out: " + out.replacingOccurrences(of: "\n", with: " | ")))
+        }
+        return (out, p.terminationStatus)
     }
 
     private func log(_ msg: String) {
@@ -292,37 +361,111 @@ final class Store: ObservableObject {
 
     /// Fire a device command, then refresh status.
     func command(_ args: [String]) {
-        commandQueue.async { [weak self] in
-            _ = self?.run(args)
-        }
-        refresh()
-    }
-
-    /// Read `status` off-main; results publish on the main thread.
-    func refresh() {
+        // A child Store owns one physical control path and shares the
+        // root's serial queue, so identical models cannot cross-control.
+        guard let targetID else { return }
+        commandError = nil
         commandQueue.async { [weak self] in
             guard let self else { return }
-            let out = self.run(["status"])
-            let dict = Self.parseStatus(out)
+            let result = self.runResult(args + ["--id", targetID])
             DispatchQueue.main.async { [weak self] in
-                self?.status = dict
-                // Seed both brightness sliders from the devices' real
-                // values (0-255 -> 0-100%) on the first read. The mouse
-                // value comes from a per-zone read (led=all is refused
-                // for reads on the Basilisk V3) — see Store.refresh.
-                if let s = self, !s.seededBrightness {
-                    if let v = Double(dict["kbd_brightness"] ?? "") {
-                        s.kbdBrightness = min(100, max(0, v / 2.55))
+                guard let self else { return }
+                self.commandError = result.exitCode == 0 ? nil : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.discoveryStore?.refresh()
+            }
+        }
+    }
+
+    /// Initial scan and the manual Detect button share the same path.
+    /// Coalesce requests; never overlap HID access or lose a post-command scan.
+    func refresh() {
+        if let discoveryStore { discoveryStore.refresh(); return }
+        guard !isDetecting else { scanPending = true; return }
+        isDetecting = true
+        detectionError = nil
+        commandQueue.async { [weak self] in
+            guard let self else { return }
+            let inventory = self.runResult(["inventory"])
+            let result = self.runResult(["detect"])
+            let bluetoothInventory = self.bluetooth?.inventory() ?? BluetoothScan()
+            let bluetoothResult = self.bluetooth?.detect() ?? BluetoothScan()
+            let decoded = result.exitCode == 0
+                ? try? JSONDecoder().decode(DetectionResult.self, from: Data(result.output.utf8)) : nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isDetecting = false
+                self.hasDetected = true
+                self.bluetoothError = bluetoothResult.error
+                if let decoded {
+                    self.inventorySignature = inventory.exitCode == 0 ? inventory.output + bluetoothInventory.signature : nil
+                    let previous = Dictionary(uniqueKeysWithValues: self.deviceStores.map { ($0.id, $0) })
+                    let devices = Self.mergeDevices(decoded.devices, bluetooth: bluetoothResult.devices)
+                    let newIDs = Set(devices.map(\.id))
+                    for store in self.deviceStores where !newIDs.contains(store.id) {
+                        store.colorDebounces.values.forEach { $0.cancel() }
                     }
-                    if let v = Double(dict["mouse_brightness"] ?? "") {
-                        s.mouseBrightness = min(100, max(0, v / 2.55))
+                    self.deviceStores = devices.map { device in
+                        let store = previous[device.id] ?? Store(targetID: device.id, commandQueue: self.commandQueue, bluetooth: self.bluetooth)
+                        store.discoveryStore = self
+                        store.detectedDevice = device
+                        var status = device.settings
+                        if let error = device.error {
+                            status["\(device.kind)_error"] = error.hasPrefix("\(device.name):")
+                                ? error : "\(device.name): \(error)"
+                        }
+                        store.status = status
+                        if let value = Double(status["kbd_brightness"] ?? "") {
+                            store.kbdBrightness = min(100, max(0, value / 2.55))
+                        }
+                        if let value = Double(status["mouse_brightness"] ?? "") {
+                            store.mouseBrightness = min(100, max(0, value / 2.55))
+                        }
+                        return store
                     }
-                    if dict["kbd_brightness"] != nil || dict["mouse_brightness"] != nil {
-                        s.seededBrightness = true
-                    }
+                } else {
+                    self.detectionError = result.exitCode == 0 ? "Couldn't read the device list. Click Detect to try again."
+                        : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
                 NotificationCenter.default.post(
                     name: Notification.Name("razerctlStatusUpdated"), object: nil)
+                if self.scanPending { self.scanPending = false; self.refresh() }
+            }
+        }
+    }
+
+    func startDetection() {
+        guard detectionTimer == nil else { return }
+        refresh()
+        // Enumeration opens no devices and writes no reports. Re-query
+        // capabilities only when something is attached or removed.
+        detectionTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.checkForDeviceChanges()
+        }
+    }
+
+    func stopDetection() { detectionTimer?.invalidate(); detectionTimer = nil }
+
+    static func mergeDevices(_ hid: [DetectedDevice], bluetooth: [DetectedDevice]) -> [DetectedDevice] {
+        // Native Bluetooth UUIDs provide independent identities, even for
+        // identical models. Remove only their duplicate Bluetooth HID rows;
+        // retain wired USB connections and unknown Bluetooth products.
+        let nativeIDs = Set(bluetooth.filter { !$0.usb_id.isEmpty }.map { String($0.usb_id.suffix(4)) })
+        return hid.filter { !($0.transport == "bluetooth" && nativeIDs.contains(String($0.usb_id.suffix(4)))) } + bluetooth
+    }
+
+    func checkForDeviceChanges() {
+        guard !isDetecting, !inventoryChecking else { return }
+        inventoryChecking = true
+        commandQueue.async { [weak self] in
+            guard let self else { return }
+            let result = self.runResult(["inventory"])
+            let bluetoothInventory = self.bluetooth?.inventory() ?? BluetoothScan()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.inventoryChecking = false
+                if result.exitCode != 0 || result.output + bluetoothInventory.signature != self.inventorySignature {
+                    self.refresh()
+                }
             }
         }
     }
@@ -353,7 +496,7 @@ final class Store: ObservableObject {
         if name == "static" {
             applyStatic(color: device == "keyboard" ? kbdColor : mouseColor, device: device)
         } else if name == "rainbow" {
-            command(["rainbow", "11"])
+            command(["rainbow", String(capabilities.zones)])
         } else {
             command(["effect", name, "--dev", device])
         }
@@ -428,11 +571,15 @@ private enum Theme {
 struct ContentView: View {
     @EnvironmentObject var store: Store
 
-    private var hasKeyboard: Bool {
-        store.status["keyboard"] != nil || store.status["keyboard_error"] != nil
-    }
-    private var hasMouse: Bool {
-        store.status["mouse"] != nil || store.status["mouse_error"] != nil
+    private var deviceList: some View {
+        VStack(spacing: 0) {
+            ForEach(store.deviceStores) { deviceStore in
+                if deviceStore.id != store.deviceStores.first?.id { PanelDivider() }
+                DetectedDeviceGroup(deviceStore: deviceStore)
+                    .environmentObject(deviceStore)
+                    .disabled(store.isDetecting || store.detectionError != nil)
+            }
+        }
     }
 
     var body: some View {
@@ -440,17 +587,21 @@ struct ContentView: View {
             TitleBar()
                 .padding(.bottom, 12)
             PanelDivider()
-            if !hasKeyboard && !hasMouse {
+            if let error = store.detectionError {
+                Text(error).font(.system(size: 12)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 10)
+            }
+            if let error = store.bluetoothError {
+                Text(error).font(.system(size: 12)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if store.deviceStores.isEmpty {
                 EmptyDevices()
+            } else if store.deviceStores.count > 2 {
+                ScrollView { deviceList }.frame(height: 550)
             } else {
-                if hasKeyboard {
-                    KeyboardGroup()
-                        .padding(.vertical, 13)
-                    if hasMouse { PanelDivider() }
-                }
-                if hasMouse {
-                    MouseGroup()
-                }
+                deviceList
             }
             PanelDivider()
             UpdateFooter()
@@ -500,6 +651,13 @@ private struct TitleBar: View {
             Text("RazerCtl")
                 .font(.system(size: 18, weight: .semibold))
             Spacer()
+            Button { store.refresh() } label: {
+                Label(store.isDetecting ? "Detecting…" : "Detect", systemImage: "arrow.clockwise")
+            }
+            .controlSize(.small)
+            .disabled(store.isDetecting)
+            .accessibilityLabel("Detect Razer devices")
+            .help("Scan connected Razer keyboards and mice for available settings")
             Menu {
                 Button("Check for Updates…") { store.checkForUpdates(force: true) }
                 Button("Keyboard Shortcuts…") { store.showKeyboardShortcuts() }
@@ -657,7 +815,7 @@ private struct LightingControls: View {
                 }
             }
             .frame(height: 28)
-            BrightnessControl(device: device)
+            if store.capabilities.brightness { BrightnessControl(device: device) }
         }
     }
 
@@ -694,15 +852,22 @@ private struct EffectMenu: NSViewRepresentable {
 
     func updateNSView(_ button: NSPopUpButton, context: Context) {
         context.coordinator.parent = self
-        if button.itemTitles != effects.map(\.1) {
+        let placeholder = selection.isEmpty ? ["Choose…"] : []
+        if button.itemTitles != placeholder + effects.map(\.1) {
             button.removeAllItems()
+            if selection.isEmpty {
+                button.addItem(withTitle: "Choose…")
+                button.lastItem?.isEnabled = false
+            }
             for (value, title) in effects {
                 button.addItem(withTitle: title)
                 button.lastItem?.representedObject = value
             }
         }
         if let index = effects.firstIndex(where: { $0.0 == selection }) {
-            button.selectItem(at: index)
+            button.selectItem(at: index + placeholder.count)
+        } else if selection.isEmpty {
+            button.selectItem(at: 0)
         }
         button.needsDisplay = true
     }
@@ -922,12 +1087,9 @@ private struct KeyboardGroup: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             DeviceHeader(icon: "keyboard", name: deviceName("keyboard", in: store.status),
-                         kind: "Keyboard", firmware: store.status["keyboard_fw"])
+                         kind: "Keyboard · \(store.detectedDevice?.connectionLabel ?? "USB")", firmware: store.status["keyboard_fw"])
             if store.status["keyboard"] != nil {
-                LightingControls(device: "keyboard", effects: [
-                    ("spectrum", "Spectrum"), ("breath", "Breath"),
-                    ("static", "Static"), ("none", "Off"),
-                ])
+                LightingControls(device: "keyboard", effects: store.capabilities.lightingEffects)
                 KeyboardShortcutsButton(shortcuts: store.shortcuts, openEditor: store.showKeyboardShortcuts)
             } else if let error = store.status["keyboard_error"] {
                 DeviceProblem(error: error)
@@ -947,26 +1109,35 @@ private struct MouseGroup: View {
         if let scroll = store.status["scroll"] {
             items.append(scroll == "free" ? "Free-spin" : "Tactile")
         }
-        return items.isEmpty ? "DPI, polling rate and scroll" : items.joined(separator: " · ")
+        return items.isEmpty ? "Available settings" : items.joined(separator: " · ")
     }
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 DeviceHeader(icon: "computermouse", name: deviceName("mouse", in: store.status),
-                             kind: "Mouse", firmware: store.status["mouse_fw"])
+                             kind: "Mouse · \(store.detectedDevice?.connectionLabel ?? "USB")", firmware: store.status["mouse_fw"])
                 if store.status["mouse"] != nil {
-                    LightingControls(device: "mouse", effects: [
-                        ("spectrum", "Spectrum"), ("wave", "Wave"),
-                        ("rainbow", "Rainbow"), ("static", "Static"), ("none", "Off"),
-                    ])
+                    if !store.capabilities.effects.isEmpty {
+                        LightingControls(device: "mouse", effects: store.capabilities.lightingEffects)
+                    } else if store.capabilities.brightness {
+                        BrightnessControl(device: "mouse")
+                    }
+                    if store.capabilities.effects.isEmpty && !store.capabilities.hasPerformance {
+                        Text("Settings couldn't be read. Click Detect to retry.")
+                            .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                    }
                     MouseButtonsButton(buttons: store.mouseButtons, openEditor: store.showMouseButtons)
                 } else if let error = store.status["mouse_error"] {
                     DeviceProblem(error: error)
                 }
+                if store.status["mouse"] != nil, let error = store.status["mouse_error"] {
+                    Text(error).font(.system(size: 12)).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.vertical, 13)
-            if store.status["mouse"] != nil {
+            if store.status["mouse"] != nil && store.capabilities.hasPerformance {
                 PanelDivider()
                 Button {
                     performanceExpanded.toggle()
@@ -1011,61 +1182,67 @@ private struct MousePerformance: View {
 
     private var stages: [String] {
         (store.status["stages"] ?? "400,800,1600,3200,6400")
-            .split(separator: ",").map(String.init)
+            .split(separator: ",").map(String.init).filter { (Int($0) ?? 0) <= store.capabilities.dpi_max }
     }
     private var isCustomDpi: Bool { !stages.contains(store.status["dpi"] ?? "") }
     private var validCustomDpi: Bool {
         guard let value = Int(customDpi.trimmingCharacters(in: .whitespaces)) else { return false }
-        return (1...26000).contains(value)
+        return value >= store.dpiMinimum && value <= store.capabilities.dpi_max
     }
 
     var body: some View {
         VStack(spacing: 12) {
-            HStack {
-                Text("DPI")
-                Spacer()
-                Picker("Mouse DPI preset", selection: dpiSelection) {
-                    ForEach(stages, id: \.self) { Text($0).tag($0) }
-                    Divider()
-                    Text("Custom…").tag("custom")
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 150)
-            }
-            if editingCustomDpi || isCustomDpi {
-                HStack(spacing: 8) {
-                    TextField("Custom DPI", text: $customDpi)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($dpiFieldFocused)
-                        .onSubmit(applyCustomDpi)
-                        .accessibilityLabel("Custom mouse DPI")
-                    Button("Apply", action: applyCustomDpi)
-                        .disabled(!validCustomDpi)
-                }
-                .help("Enter a DPI between 1 and 26000")
-            }
-            HStack {
-                Text("Polling rate")
-                Spacer()
-                Picker("Mouse polling rate", selection: pollSelection) {
-                    Text("125 Hz").tag("125")
-                    Text("500 Hz").tag("500")
-                    Text("1000 Hz").tag("1000")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 192)
-                .help("Report rate — higher means a snappier cursor.")
-            }
-            HStack {
-                Text("Free-spin scroll")
-                Spacer()
-                Toggle("Free-spin scroll", isOn: scrollBinding)
+            if store.capabilities.dpi_max > 0 {
+                HStack {
+                    Text("DPI")
+                    Spacer()
+                    Picker("Mouse DPI preset", selection: dpiSelection) {
+                        ForEach(stages, id: \.self) { Text($0).tag($0) }
+                        Divider()
+                        Text("Custom…").tag("custom")
+                    }
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                }
+                if editingCustomDpi || isCustomDpi {
+                    HStack(spacing: 8) {
+                        TextField("Custom DPI", text: $customDpi)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($dpiFieldFocused)
+                            .onSubmit(applyCustomDpi)
+                            .accessibilityLabel("Custom mouse DPI")
+                        Button("Apply", action: applyCustomDpi)
+                            .disabled(!validCustomDpi)
+                    }
+                    .help("Enter a DPI between \(store.dpiMinimum) and \(store.capabilities.dpi_max)")
+                }
+            }
+            if !store.capabilities.poll_rates.isEmpty {
+                HStack {
+                    Text("Polling rate")
+                    Spacer()
+                    Picker("Mouse polling rate", selection: pollSelection) {
+                        ForEach(store.capabilities.poll_rates, id: \.self) { rate in
+                            Text("\(rate) Hz").tag(String(rate))
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
                     .controlSize(.small)
+                    .frame(width: 192)
+                    .help("Report rate — higher means a snappier cursor.")
+                }
+            }
+            if store.capabilities.scroll {
+                HStack {
+                    Text("Free-spin scroll")
+                    Spacer()
+                    Toggle("Free-spin scroll", isOn: scrollBinding)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                }
             }
         }
         .onReceive(store.$status) { status in
@@ -1102,6 +1279,37 @@ private struct MousePerformance: View {
 }
 
 // MARK: - Device and empty states
+
+private struct DetectedDeviceGroup: View {
+    @ObservedObject var deviceStore: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let device = deviceStore.detectedDevice {
+                if !device.supported {
+                    VStack(alignment: .leading, spacing: 8) {
+                        DeviceHeader(icon: "cable.connector", name: device.name,
+                                     kind: "\(device.connectionLabel)\(device.usb_id.isEmpty ? "" : " · \(device.usb_id)")", firmware: nil)
+                        Text(device.transport == "bluetooth"
+                            ? "Bluetooth customization for this model isn't supported yet. Try its USB cable or wireless USB receiver."
+                            : "Customization for this model isn't supported yet.")
+                            .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }.padding(.vertical, 13)
+                } else if device.kind == "keyboard" {
+                    KeyboardGroup()
+                        .padding(.vertical, 13)
+                } else {
+                    MouseGroup()
+                }
+            }
+            if let error = deviceStore.commandError {
+                Text(error).font(.system(size: 12)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true).padding(.bottom, 10)
+            }
+        }
+    }
+}
 
 private func deviceName(_ device: String, in status: [String: String]) -> String {
     if let name = status[device] { return name }
@@ -1143,14 +1351,16 @@ private struct DeviceProblem: View {
 }
 
 private struct EmptyDevices: View {
+    @EnvironmentObject var store: Store
+
     var body: some View {
         VStack(spacing: 8) {
             Image(systemName: "keyboard")
                 .font(.system(size: 28, weight: .regular))
                 .foregroundStyle(Theme.secondary)
-            Text("No Razer devices detected")
+            Text(store.isDetecting || !store.hasDetected ? "Looking for Razer devices…" : "No Razer devices detected")
                 .font(.system(size: 14, weight: .semibold))
-            Text("Plug in your Razer keyboard or mouse, then open RazerCtl again.")
+            Text("Connect by USB or its receiver, or pair your device in macOS Bluetooth settings. RazerCtl scans automatically; click Detect to try again.")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)
@@ -1164,7 +1374,7 @@ private struct EmptyDevices: View {
 // MARK: - App bootstrap
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let store = Store()
+    let store = Store(bluetooth: BluetoothController())
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
     private var hosting: NSHostingController<AnyView>?
@@ -1234,7 +1444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.popover.contentSize = size
         }
 
-        store.refresh()
+        store.startDetection()
         store.checkForUpdates()
         store.shortcuts.start()
         store.mouseButtons.start()
@@ -1253,6 +1463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         store.shortcuts.stop()
         store.mouseButtons.stop()
+        store.stopDetection()
     }
 
     /// Show the popover (used by the post-update confirmation).
