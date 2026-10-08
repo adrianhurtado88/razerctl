@@ -3,6 +3,10 @@
 // Popover UI (SwiftUI) + Rust core (`razerctl-core`, adjacent binary).
 // All device commands run on a serial background queue: the UI never
 // blocks and commands never overlap.
+//
+// The panel follows the macOS grouped-settings idiom: one inset group per
+// device, label-left / control-right rows separated by hairlines, no cards,
+// no shadows, system accent on controls only.
 
 import SwiftUI
 import AppKit
@@ -163,6 +167,37 @@ final class Store: ObservableObject {
     func setScroll(free: Bool) {
         command(["scroll", free ? "free" : "tactile"])
     }
+
+    // MARK: App actions
+
+    /// Deep link to Privacy & Security › Input Monitoring, where the
+    /// keyboard's control collection is gated.
+    static func openInputMonitoringSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    static func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
+    }
+}
+
+// MARK: - Theme
+
+/// The few colours the panel paints itself. Text, controls and the popover
+/// ground are the system's; only the group fill and hairline are ours.
+private enum Theme {
+    static let groupRadius: CGFloat = 8
+
+    static func groupFill(_ scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color.white.opacity(0.06) : Color.white
+    }
+
+    static func separator(_ scheme: ColorScheme) -> Color {
+        Color(nsColor: .separatorColor)
+    }
 }
 
 // MARK: - Content View
@@ -170,116 +205,168 @@ final class Store: ObservableObject {
 struct ContentView: View {
     @EnvironmentObject var store: Store
 
+    private var hasKeyboard: Bool {
+        store.status["keyboard"] != nil || store.status["keyboard_error"] != nil
+    }
+    private var hasMouse: Bool {
+        store.status["mouse"] != nil || store.status["mouse_error"] != nil
+    }
+
     var body: some View {
         // Fixed width; height is whatever the content needs (see
         // AppDelegate: sizingStyle .preferredContentSize means the
         // popover adopts this view's ideal height). No scroll: the
-        // whole panel always fits, regardless of which cards show.
-        VStack(spacing: 16) {
-            HeaderView()
-                .padding(.horizontal, 2)
-            if store.status["keyboard"] != nil || store.status["keyboard_error"] != nil {
-                KeyboardCard()
+        // whole panel always fits, regardless of which groups show.
+        VStack(spacing: 10) {
+            TitleBar()
+            if !hasKeyboard && !hasMouse {
+                EmptyGroup()
+            } else {
+                if hasKeyboard { KeyboardGroup() }
+                if hasMouse { MouseGroup() }
             }
-            if store.status["mouse"] != nil || store.status["mouse_error"] != nil {
-                MouseCard()
-            }
-            if store.status["keyboard"] == nil && store.status["mouse"] == nil
-                && store.status["keyboard_error"] == nil && store.status["mouse_error"] == nil {
-                NotFoundCard()
-            }
-            FooterView()
-                .padding(.horizontal, 2)
         }
-        .padding(16)
-        .frame(width: 380)
+        .padding(EdgeInsets(top: 10, leading: 12, bottom: 12, trailing: 12))
+        .frame(width: 340)
     }
 }
 
-// MARK: - Header / Footer
+// MARK: - Title bar
 
-private struct HeaderView: View {
-    @EnvironmentObject var store: Store
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "keyboard")
-                .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("RazerCtl")
-                    .font(.system(size: 15, weight: .semibold))
-                Text("Local control · no Synapse")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Circle()
-                .fill((store.status["keyboard"] != nil && store.status["mouse"] != nil)
-                      ? Color.green : Color.orange)
-                .frame(width: 8, height: 8)
-        }
-        .padding(.horizontal, 4)
-    }
-}
-
-private struct FooterView: View {
+private struct TitleBar: View {
     var body: some View {
         HStack {
-            Text("v1.0")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("RazerCtl")
+                .font(.system(size: 13, weight: .semibold))
             Spacer()
-            Button("Quit RazerCtl") {
-                NSApp.terminate(nil)
+            Menu {
+                Button("About RazerCtl") { Store.showAbout() }
+                Divider()
+                Button("Quit RazerCtl") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q")
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
             }
-            .controlSize(.small)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More")
         }
-        .padding(.horizontal, 4)
+        .frame(height: 24)
+        .padding(.leading, 4)
     }
 }
 
-private struct NotFoundCard: View {
+// MARK: - Group building blocks
+
+/// An inset settings group: rounded, hairline-outlined, rows inside.
+private struct SettingsGroup<Content: View>: View {
+    @Environment(\.colorScheme) private var scheme
+    @ViewBuilder let content: Content
+
     var body: some View {
-        GroupBox {
-            HStack(spacing: 10) {
-                Image(systemName: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                Text("No Razer devices detected — plug them in and reopen.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 0) {
+            content
         }
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.groupRadius, style: .continuous)
+                .fill(Theme.groupFill(scheme))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.groupRadius, style: .continuous)
+                .strokeBorder(Theme.separator(scheme), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: Theme.groupRadius, style: .continuous))
+    }
+}
+
+/// The first row of a device group: glyph, device name, firmware.
+private struct GroupHeader: View {
+    @Environment(\.colorScheme) private var scheme
+    let icon: String
+    let name: String
+    let detail: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                Text(name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(height: 32)
+            .padding(.horizontal, 12)
+            Rectangle()
+                .fill(Theme.separator(scheme))
+                .frame(height: 1)
+        }
+    }
+}
+
+/// Hairline between two rows, inset from the leading edge like a list.
+private struct RowDivider: View {
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        Rectangle()
+            .fill(Theme.separator(scheme))
+            .frame(height: 1)
+            .padding(.leading, 12)
+    }
+}
+
+/// One settings row: label at the leading edge, control at the trailing edge.
+private struct SettingRow<Control: View>: View {
+    let label: LocalizedStringKey
+    @ViewBuilder let control: Control
+
+    init(_ label: LocalizedStringKey, @ViewBuilder control: () -> Control) {
+        self.label = label
+        self.control = control()
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .lineLimit(1)
+            Spacer(minLength: 12)
+            control
+        }
+        .frame(height: 34)
+        .padding(.horizontal, 12)
     }
 }
 
 // MARK: - Shared rows
 
-private struct EffectRow: View {
+private struct EffectPicker: View {
     @EnvironmentObject var store: Store
     let device: String
     let effects: [(String, String)]   // (raw command, display name)
 
-    private let labelWidth: CGFloat = 92
-
     var body: some View {
-        HStack(spacing: 12) {
-            Text("Effect")
-                .foregroundStyle(.secondary)
-                .frame(width: labelWidth, alignment: .leading)
-            Picker("Effect", selection: selectionBinding) {
-                ForEach(effects, id: \.0) { fx in
-                    Text(fx.1).tag(fx.0)
-                }
+        // Menu style: four long labels would overflow a segmented control.
+        Picker("Lighting", selection: selectionBinding) {
+            ForEach(effects, id: \.0) { fx in
+                Text(fx.1).tag(fx.0)
             }
-            // Menu style: segmented pickers refuse to compress below their
-            // ideal width (4 long labels ~360pt) and overflow the card;
-            // menu pickers always fit the width they're given.
-            .pickerStyle(.menu)
-            .frame(maxWidth: .infinity)
-            .lineLimit(1)
         }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .frame(width: 124)
     }
 
     private var selectionBinding: Binding<String> {
@@ -296,21 +383,13 @@ private struct EffectRow: View {
     }
 }
 
-private struct ColorRow: View {
+private struct ColorWell: View {
     @EnvironmentObject var store: Store
     let device: String
 
-    private let labelWidth: CGFloat = 92
-
     var body: some View {
-        HStack(spacing: 12) {
-            Text("Static color")
-                .foregroundStyle(.secondary)
-                .frame(width: labelWidth, alignment: .leading)
-            ColorPicker("", selection: colorBinding, supportsOpacity: false)
-                .labelsHidden()
-                .frame(maxWidth: .infinity)
-        }
+        ColorPicker("Color", selection: colorBinding, supportsOpacity: false)
+            .labelsHidden()
     }
 
     private var colorBinding: Binding<Color> {
@@ -328,18 +407,26 @@ private struct BrightnessRow: View {
     let device: String
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Text("Brightness")
+                .frame(width: 84, alignment: .leading)
+            Image(systemName: "sun.min")
+                .font(.system(size: 10))
                 .foregroundStyle(.secondary)
-                .frame(width: 92, alignment: .leading)
+            // Commits on release only: every command is ~100 ms of device I/O.
             Slider(value: sliderValue, in: 0...100, step: 1, onEditingChanged: { editing in
                 if !editing { store.setBrightness(value, device: device) }
             })
-            Text("\(Int(value))%")
-                .font(.callout.monospacedDigit())
+            Image(systemName: "sun.max")
+                .font(.system(size: 13))
                 .foregroundStyle(.secondary)
-                .frame(width: 38, alignment: .trailing)
+            Text("\(Int(value))%")
+                .font(.system(size: 11).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .trailing)
         }
+        .frame(height: 34)
+        .padding(.horizontal, 12)
     }
 
     private var value: Double {
@@ -359,133 +446,109 @@ private struct BrightnessRow: View {
     }
 }
 
-private struct DeviceCaption: View {
-    let name: String?
-    let fw: String?
-    let error: String?
+/// Shown inside a device group when the device is present but the core
+/// could not talk to it. A refused HID open on macOS means the Input
+/// Monitoring grant is missing; anything else shows the core's message.
+private struct DeviceProblem: View {
+    let error: String
 
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(name ?? "Unavailable")
-                .font(.system(size: 13, weight: .semibold))
-            if let fw {
-                Text("fw \(fw)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if let error {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .help(error)
-            }
-        }
+    private var needsInputMonitoring: Bool {
+        error.localizedCaseInsensitiveContains("not permitted")
+            || error.localizedCaseInsensitiveContains("HID open failed")
     }
-}
-
-// MARK: - Card components
-
-/// A macOS-style card: soft background, 14pt padding, roomy corners.
-private struct Card<Content: View>: View {
-    let title: LocalizedStringKey
-    let icon: String
-    @ViewBuilder let content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Label(title, systemImage: icon)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 10)
-            content
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .controlBackgroundColor))
-                .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-        )
-    }
-}
-
-/// A labelled group of rows inside a card, separated by a divider.
-private struct CardSection: View {
-    let label: LocalizedStringKey
-    @ViewBuilder let content: AnyView
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(label)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.tertiary)
-                .textCase(.uppercase)
-            content
-        }
-        .padding(.vertical, 2)
-    }
-}
-
-/// Thin divider used between card sections.
-private struct CardDivider: View {
-    var body: some View {
-        Divider().padding(.vertical, 6)
-    }
-}
-
-// MARK: - Keyboard card
-
-private struct KeyboardCard: View {
-    @EnvironmentObject var store: Store
-
-    var body: some View {
-        Card(title: "Keyboard", icon: "keyboard") {
-            VStack(alignment: .leading, spacing: 10) {
-                DeviceCaption(
-                    name: store.status["keyboard"],
-                    fw: store.status["keyboard_fw"],
-                    error: store.status["keyboard_error"]
-                )
-                if store.status["keyboard"] != nil {
-                    CardSection(label: "Lighting") {
-                        AnyView(
-                            VStack(spacing: 10) {
-                                EffectRow(device: "keyboard", effects: [
-                                    ("spectrum", "Spectrum"),
-                                    ("breath", "Breath"),
-                                    ("none", "Off"),
-                                ])
-                                ColorRow(device: "keyboard")
-                            }
-                        )
-                    }
-                    CardDivider()
-                    BrightnessRow(device: "keyboard")
-                } else if let err = store.status["keyboard_error"] {
-                    Text(err)
-                        .font(.caption)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(.orange)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(needsInputMonitoring ? "Input Monitoring required" : "Can't reach this device")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(needsInputMonitoring
+                         ? "macOS blocks control of this device until RazerCtl is allowed under Privacy & Security."
+                         : error)
+                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if needsInputMonitoring {
+                    Button("Open System Settings…") { Store.openInputMonitoringSettings() }
+                        .controlSize(.small)
                 }
             }
+            Spacer(minLength: 0)
+        }
+        .padding(EdgeInsets(top: 10, leading: 12, bottom: 12, trailing: 12))
+        .help(error)
+    }
+}
+
+/// The core's error lines start with the device's name ("Razer Basilisk V3: …").
+private func deviceName(fromError error: String) -> String? {
+    guard error.hasPrefix("Razer "), let colon = error.firstIndex(of: ":") else { return nil }
+    return String(error[..<colon])
+}
+
+// MARK: - Keyboard group
+
+private struct KeyboardGroup: View {
+    @EnvironmentObject var store: Store
+
+    private var name: String {
+        store.status["keyboard"]
+            ?? store.status["keyboard_error"].flatMap(deviceName(fromError:))
+            ?? "Keyboard"
+    }
+
+    var body: some View {
+        SettingsGroup {
+            GroupHeader(icon: "keyboard", name: name,
+                        detail: store.status["keyboard_fw"].map { "fw \($0)" })
+            if store.status["keyboard"] != nil {
+                SettingRow("Lighting") {
+                    EffectPicker(device: "keyboard", effects: [
+                        ("spectrum", "Spectrum"),
+                        ("breath", "Breath"),
+                        ("none", "Off"),
+                    ])
+                }
+                RowDivider()
+                SettingRow("Color") {
+                    ColorWell(device: "keyboard")
+                }
+                RowDivider()
+                BrightnessRow(device: "keyboard")
+            } else if let err = store.status["keyboard_error"] {
+                DeviceProblem(error: err)
+            }
         }
     }
 }
 
-// MARK: - Mouse card
+// MARK: - Mouse group
 
-private struct MouseCard: View {
+private struct MouseGroup: View {
     @EnvironmentObject var store: Store
     @State private var customDpi = ""
     @FocusState private var dpiFieldFocused: Bool
 
+    private var name: String {
+        store.status["mouse"]
+            ?? store.status["mouse_error"].flatMap(deviceName(fromError:))
+            ?? "Mouse"
+    }
+
     private var stages: [String] {
         (store.status["stages"] ?? "400,800,1600,3200,6400")
             .split(separator: ",").map(String.init)
+    }
+
+    private var isCustomDpi: Bool {
+        let dpi = store.status["dpi"] ?? ""
+        return !stages.contains(dpi)
     }
 
     private var dpiSelection: Binding<String> {
@@ -519,89 +582,71 @@ private struct MouseCard: View {
     }
 
     var body: some View {
-        Card(title: "Mouse", icon: "computermouse") {
-            VStack(alignment: .leading, spacing: 10) {
-                DeviceCaption(
-                    name: store.status["mouse"],
-                    fw: store.status["mouse_fw"],
-                    error: store.status["mouse_error"]
-                )
+        SettingsGroup {
+            GroupHeader(icon: "computermouse", name: name,
+                        detail: store.status["mouse_fw"].map { "fw \($0)" })
 
-                if store.status["mouse"] != nil {
-                    // DPI
-                    CardSection(label: "Sensitivity") {
-                        AnyView(
-                            VStack(spacing: 8) {
-                                HStack(spacing: 12) {
-                                    Text("DPI").foregroundStyle(.secondary)
-                                        .frame(width: 92, alignment: .leading)
-                                    Picker("DPI", selection: dpiSelection) {
-                                        ForEach(stages, id: \.self) { Text($0).tag($0) }
-                                        Text("Custom").tag("custom")
-                                    }
-                                    .pickerStyle(.menu)
-                                    .frame(maxWidth: .infinity)
-                                }
-                                if dpiSelection.wrappedValue == "custom" {
-                                    HStack(spacing: 8) {
-                                        Spacer()
-                                        Text("Custom value:")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                        TextField("e.g. 1800", text: $customDpi)
-                                            .textFieldStyle(.roundedBorder)
-                                            .frame(width: 96)
-                                            .focused($dpiFieldFocused)
-                                            .onSubmit(applyCustomDpi)
-                                        Button("Apply", action: applyCustomDpi)
-                                            .controlSize(.small)
-                                    }
-                                }
-                                HStack(spacing: 12) {
-                                    Text("Polling").foregroundStyle(.secondary)
-                                        .frame(width: 92, alignment: .leading)
-                                    Picker("Polling rate", selection: pollSelection) {
-                                        Text("125").tag("125")
-                                        Text("500").tag("500")
-                                        Text("1000").tag("1000")
-                                    }
-                                    .pickerStyle(.segmented)
-                                    .frame(maxWidth: .infinity)
-                                }
-                                .help("Report rate in Hz — higher means snappier cursor.")
-                            }
-                        )
+            if store.status["mouse"] != nil {
+                SettingRow("DPI") {
+                    Picker("DPI", selection: dpiSelection) {
+                        ForEach(stages, id: \.self) { Text($0).tag($0) }
+                        Divider()
+                        Text("Custom…").tag("custom")
                     }
-
-                    CardDivider()
-
-                    // Lighting
-                    CardSection(label: "Lighting") {
-                        AnyView(
-                            VStack(spacing: 10) {
-                                EffectRow(device: "mouse", effects: [
-                                    ("spectrum", "Spectrum"),
-                                    ("wave", "Wave"),
-                                    ("rainbow", "Rainbow"),
-                                    ("none", "Off"),
-                                ])
-                                ColorRow(device: "mouse")
-                            }
-                        )
-                    }
-
-                    CardDivider()
-
-                    BrightnessRow(device: "mouse")
-
-                    CardDivider()
-
-                    Toggle("Free-spin scroll wheel", isOn: scrollBinding)
-                } else if let err = store.status["mouse_error"] {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(width: 124)
                 }
+                if isCustomDpi {
+                    RowDivider()
+                    SettingRow("Custom DPI") {
+                        HStack(spacing: 8) {
+                            // Placeholder = the value the device reports now.
+                            TextField(store.status["dpi"] ?? "e.g. 1800", text: $customDpi)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 96)
+                                .focused($dpiFieldFocused)
+                                .onSubmit(applyCustomDpi)
+                            Button("Apply", action: applyCustomDpi)
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                RowDivider()
+                SettingRow("Polling rate") {
+                    Picker("Polling rate", selection: pollSelection) {
+                        Text("125 Hz").tag("125")
+                        Text("500 Hz").tag("500")
+                        Text("1000 Hz").tag("1000")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 186)
+                    .help("Report rate — higher means a snappier cursor.")
+                }
+                RowDivider()
+                SettingRow("Lighting") {
+                    EffectPicker(device: "mouse", effects: [
+                        ("spectrum", "Spectrum"),
+                        ("wave", "Wave"),
+                        ("rainbow", "Rainbow"),
+                        ("none", "Off"),
+                    ])
+                }
+                RowDivider()
+                SettingRow("Color") {
+                    ColorWell(device: "mouse")
+                }
+                RowDivider()
+                BrightnessRow(device: "mouse")
+                RowDivider()
+                SettingRow("Free-spin scroll wheel") {
+                    Toggle("Free-spin scroll wheel", isOn: scrollBinding)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                }
+            } else if let err = store.status["mouse_error"] {
+                DeviceProblem(error: err)
             }
         }
     }
@@ -611,6 +656,30 @@ private struct MouseCard: View {
         guard Int(v) != nil else { return }
         store.setDpi(v)
         dpiFieldFocused = false
+    }
+}
+
+// MARK: - Empty state
+
+private struct EmptyGroup: View {
+    var body: some View {
+        SettingsGroup {
+            VStack(spacing: 6) {
+                Image(systemName: "keyboard")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 4)
+                Text("No Razer devices detected")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Plug in your Razer keyboard or mouse, then open RazerCtl again.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(EdgeInsets(top: 28, leading: 20, bottom: 28, trailing: 20))
+        }
     }
 }
 
@@ -624,7 +693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Keep the popover sized to the SwiftUI content's ideal size.
     /// Status loads asynchronously (~30 ms) after launch — the panel would
-    /// otherwise lock its size to the empty skeleton and CLIP the cards
+    /// otherwise lock its size to the empty skeleton and CLIP the groups
     /// once they appear ("sides cut out"). Re-sync on every status update.
     private func syncSize() {
         guard let hosting else { return }
@@ -658,7 +727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = host
 
         // Resize whenever the status (and thus panel content) changes:
-        // cards appearing must grow the popover, never clip it.
+        // groups appearing must grow the popover, never clip it.
         NotificationCenter.default.addObserver(
             forName: Notification.Name("razerctlStatusUpdated"),
             object: nil, queue: .main) { [weak self] _ in
