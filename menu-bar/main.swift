@@ -34,6 +34,172 @@ final class Store: ObservableObject {
     /// Every core call is logged here — ground truth from the GUI context.
     static let logURL = URL(fileURLWithPath: "/tmp/razerctl-widget.log")
 
+    // MARK: Self-update state
+
+    /// Embedded app version (bumped by publish.sh). Compared against the
+    /// latest GitHub release tag.
+    static let appVersion = "1.0.1"
+
+    @Published var latestVersion: String?
+    @Published var updating = false
+    @Published var updateError: String?
+    private var assetURL: URL?
+    private let repo = "adrianhurtado88/razerctl"
+
+    /// Check GitHub for a newer release. Throttled to one call per 10 min
+    /// ( UserDefaults), re-checked at launch and popover open.
+    func checkForUpdates() {
+        let last = UserDefaults.standard.double(forKey: "lastUpdateCheck")
+        guard Date().timeIntervalSince1970 - last > 600 else { return }
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
+
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("RazerCtl", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 10
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self,
+                  let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = obj["tag_name"] as? String else { return }
+            let latest = tag.replacingOccurrences(of: "v", with: "")
+            DispatchQueue.main.async {
+                guard Self.isNewer(latest, than: Self.appVersion) else {
+                    self.latestVersion = nil
+                    return
+                }
+                self.latestVersion = latest
+                if let assets = obj["assets"] as? [[String: Any]],
+                   let urlStr = assets.compactMap({ $0["browser_download_url"] as? String })
+                       .first(where: { $0.hasSuffix(".zip") }) {
+                    self.assetURL = URL(string: urlStr)
+                }
+            }
+        }.resume()
+    }
+
+    /// Numeric component compare: "1.1" > "1.0.1" etc.
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    /// One-click self-update: download the release zip, verify it is
+    /// signed by the SAME Developer ID team as this running app (tamper
+    /// check — and the shared team is what keeps the Input Monitoring
+    /// grant alive across updates), swap bundles, relaunch.
+    func performUpdate() {
+        guard let assetURL else {
+            updateError = "No downloadable asset found"
+            return
+        }
+        updating = true
+        updateError = nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                // 1. Download the zip.
+                let zipURL = try Self.downloadSync(assetURL)
+                // 2. Unzip to a fresh temp dir.
+                let tmp = NSTemporaryDirectory() + "razerctl-update-\(UUID().uuidString)"
+                try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+                try Self.runCmd("/usr/bin/ditto", ["-x", "-k", zipURL.path, tmp])
+                let newApp = tmp + "/RazerCtl.app"
+                guard FileManager.default.fileExists(atPath: newApp + "/Contents/MacOS/RazerCtl") else {
+                    throw UpdateError.badArchive
+                }
+                // 3. Signature check: same code-signing team as us.
+                guard let newTeam = Self.teamIdentifier(of: newApp),
+                      let curTeam = Self.teamIdentifier(of: Bundle.main.bundlePath),
+                      newTeam == curTeam else {
+                    throw UpdateError.signatureMismatch
+                }
+                // 4. Swap: current -> .old, new -> current. The running
+                //    process keeps its image; macOS allows this.
+                let bundle = Bundle.main.bundlePath
+                let parent = (bundle as NSString).deletingLastPathComponent
+                let old = parent + "/RazerCtl.old.app"
+                try? FileManager.default.removeItem(atPath: old)
+                try FileManager.default.moveItem(atPath: bundle, toPath: old)
+                try FileManager.default.moveItem(atPath: newApp, toPath: bundle)
+                // 5. The downloaded file is quarantined; this app is not
+                //    notarized, so clear it or Gatekeeper blocks relaunch.
+                try Self.runCmd("/usr/bin/xattr",
+                                 ["-dr", "com.apple.quarantine", bundle])
+                // 6. Launch the new version, then exit this one. The new
+                //    instance deletes the .old bundle at startup.
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: bundle + "/Contents/MacOS/RazerCtl")
+                try p.run()
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.updating = false
+                    self?.updateError = "Update failed: \(error.localizedDescription.isEmpty ? "\(error)" : error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    enum UpdateError: LocalizedError {
+        case badArchive, signatureMismatch
+        var errorDescription: String? {
+            switch self {
+            case .badArchive: return "the release zip has no RazerCtl.app"
+            case .signatureMismatch: return "downloaded app is signed by a different team"
+            }
+        }
+    }
+
+    /// Blocking download with a completion handler API (Swift 5 friendly).
+    private static func downloadSync(_ url: URL) throws -> URL {
+        var result: URL?
+        var failure: Error?
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.downloadTask(with: url) { u, _, e in
+            result = u; failure = e; sem.signal()
+        }.resume()
+        sem.wait()
+        if let e = failure { throw e }
+        guard let u = result else { throw URLError(.badServerResponse) }
+        return u
+    }
+
+    /// Run a command; throw on non-zero exit.
+    private static func runCmd(_ path: String, _ args: [String]) throws {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        try p.run()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else {
+            throw UpdateError.badArchive
+        }
+    }
+
+    /// The bundle's code-signing team identifier (e.g. "YC4FHM93C5").
+    private static func teamIdentifier(of bundlePath: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        p.arguments = ["-dv", "--verbose=4", bundlePath]
+        let err = Pipe()
+        p.standardError = err
+        p.standardOutput = Pipe()
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        let out = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return out.split(separator: "\n")
+            .first { $0.hasPrefix("TeamIdentifier=") }?
+            .replacingOccurrences(of: "TeamIdentifier=", with: "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+
     var coreURL: URL? {
         let dir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let core = dir.appendingPathComponent("razerctl-core")
@@ -219,6 +385,9 @@ struct ContentView: View {
         // whole panel always fits, regardless of which groups show.
         VStack(spacing: 10) {
             TitleBar()
+            if store.latestVersion != nil {
+                UpdateBanner()
+            }
             if !hasKeyboard && !hasMouse {
                 EmptyGroup()
             } else {
@@ -228,6 +397,50 @@ struct ContentView: View {
         }
         .padding(EdgeInsets(top: 10, leading: 12, bottom: 12, trailing: 12))
         .frame(width: 340)
+    }
+}
+
+// MARK: - Update banner
+
+/// "vX.Y available" group, in the panel's grouped-settings idiom: inset,
+/// hairline-outlined, yellow accent. One click: download, verify
+/// signature, swap bundles, relaunch.
+private struct UpdateBanner: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("v\(store.latestVersion ?? "") available")
+                    .font(.system(size: 12, weight: .semibold))
+                if let err = store.updateError {
+                    Text(err)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+            }
+            Spacer()
+            if store.updating {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Button("Update Now") { store.performUpdate() }
+                    .controlSize(.small)
+            }
+        }
+        .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
+        .background(
+            RoundedRectangle(cornerRadius: Theme.groupRadius)
+                .fill(Color.yellow.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.groupRadius)
+                .stroke(Color.yellow.opacity(0.30), lineWidth: 1)
+        )
     }
 }
 
@@ -710,6 +923,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem = item
 
+        // Self-update housekeeping: remove the replaced bundle left by a
+        // previous update (this instance is already running from it).
+        let oldBundle = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
+            + "/RazerCtl.old.app"
+        try? FileManager.default.removeItem(atPath: oldBundle)
+
         // .applicationDefined: stays open when focus moves elsewhere —
         // .transient auto-dismisses on ANY focus change, which made the
         // panel vanish the instant a screenshot tool (or any other app)
@@ -735,6 +954,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         store.refresh()
+        store.checkForUpdates()
     }
 
     @objc private func togglePopover() {
@@ -742,6 +962,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
         } else if let button = statusItem?.button {
             store.refresh()
+            store.checkForUpdates()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             // The fresh status lands a moment after show — grow to fit.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
