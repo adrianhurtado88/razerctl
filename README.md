@@ -29,6 +29,41 @@ Last state (see "Resume here" below):
 - ⚠️ **Widget UI itself not yet clicked through by the user** — menu items
   and actions are unverified in real use.
 
+## Install
+
+**On this Mac**: already done — the app lives at `~/Applications/RazerCtl.app`,
+launches at login (Login Items), and the Input Monitoring grant is tied to
+the Developer ID signature (survives rebuilds).
+
+**On any Mac, from the release** (no build tools needed):
+
+```sh
+# 1. Download and unzip
+curl -LO https://github.com/adrianhurtado88/razerctl/releases/download/v1.0/RazerCtl-v1.0.zip
+unzip RazerCtl-v1.0.zip
+# 2. Install
+mv RazerCtl.app /Applications/   # or ~/Applications/
+# 3. First launch (clears the downloaded-file quarantine prompt)
+xattr -dr com.apple.quarantine RazerCtl.app && open RazerCtl.app
+# 4. One-time privacy grant
+#    System Settings → Privacy & Security → Input Monitoring → RazerCtl → ON
+#    (needed for keyboard control; the mouse works without it)
+```
+
+**From source** (Xcode command-line tools + Rust):
+
+```sh
+git clone https://github.com/adrianhurtado88/razerctl && cd razerctl
+./build-widget.sh          # cargo + swiftc + bundle + Developer ID/ad-hoc sign
+open "${TMPDIR}RazerCtl.app"
+```
+
+Notes for other machines: without a Developer ID identity (only present on
+the build Mac), the script falls back to ad-hoc signing — macOS treats each
+rebuild as a new identity, so the Input Monitoring grant must be re-toggled
+after every rebuild. The release zip is Developer-ID-signed, so the grant
+is stable there.
+
 ## Build & run
 
 ```sh
