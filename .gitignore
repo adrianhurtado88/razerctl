@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+
+# Built app bundles (assembled by build-widget.sh)
+/build/
+*.app
+
+# macOS
+.DS_Store
+
+# Widget diagnostics log
+*.log
