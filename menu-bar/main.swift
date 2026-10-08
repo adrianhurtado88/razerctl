@@ -4,9 +4,8 @@
 // All device commands run on a serial background queue: the UI never
 // blocks and commands never overlap.
 //
-// The panel follows the macOS grouped-settings idiom: one inset group per
-// device, label-left / control-right rows separated by hairlines, no cards,
-// no shadows, system accent on controls only.
+// Lighting-first panel: one shared charcoal surface, wide brightness
+// controls, and mouse performance settings behind a disclosure.
 
 import SwiftUI
 import AppKit
@@ -283,11 +282,7 @@ final class Store: ObservableObject {
         commandQueue.async { [weak self] in
             guard let self else { return }
             let out = self.run(["status"])
-            var dict: [String: String] = [:]
-            for line in out.split(separator: "\n") {
-                let kv = line.split(separator: "=", maxSplits: 1)
-                if kv.count == 2 { dict[String(kv[0])] = String(kv[1]) }
-            }
+            let dict = Self.parseStatus(out)
             DispatchQueue.main.async { [weak self] in
                 self?.status = dict
                 // Seed both brightness sliders from the devices' real
@@ -311,10 +306,32 @@ final class Store: ObservableObject {
         }
     }
 
+    /// Device names and firmware share a line in the existing CLI format.
+    /// Split that metadata without splitting the spaces in device names.
+    static func parseStatus(_ output: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for line in output.split(separator: "\n") {
+            let pair = line.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2 else { continue }
+            let key = String(pair[0])
+            let value = String(pair[1])
+            if (key == "keyboard" || key == "mouse"),
+               let metadata = value.range(of: " \(key)_fw=") {
+                result[key] = String(value[..<metadata.lowerBound])
+                result["\(key)_fw"] = String(value[metadata.upperBound...])
+            } else {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
     // MARK: Device actions
 
     func applyEffect(_ name: String, device: String) {
-        if name == "rainbow" {
+        if name == "static" {
+            applyStatic(color: device == "keyboard" ? kbdColor : mouseColor, device: device)
+        } else if name == "rainbow" {
             command(["rainbow", "11"])
         } else {
             command(["effect", name, "--dev", device])
@@ -322,6 +339,8 @@ final class Store: ObservableObject {
     }
 
     func applyStatic(color: Color, device: String) {
+        if device == "keyboard" { kbdColor = color }
+        else { mouseColor = color }
         // The native color picker fires continuously while dragging;
         // debounce so the device gets the final color, not one per tick.
         colorDebounces[device]?.cancel()
@@ -373,20 +392,14 @@ final class Store: ObservableObject {
     }
 }
 
-// MARK: - Theme
+// MARK: - Lighting-first theme
 
-/// The few colours the panel paints itself. Text, controls and the popover
-/// ground are the system's; only the group fill and hairline are ours.
 private enum Theme {
-    static let groupRadius: CGFloat = 8
-
-    static func groupFill(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.white.opacity(0.06) : Color.white
-    }
-
-    static func separator(_ scheme: ColorScheme) -> Color {
-        Color(nsColor: .separatorColor)
-    }
+    static let background = Color(red: 0.141, green: 0.149, blue: 0.165)
+    static let secondary = Color(red: 0.72, green: 0.73, blue: 0.76)
+    static let separator = Color.white.opacity(0.15)
+    static let keyboardAccent = Color(red: 1.00, green: 0.22, blue: 0.39)
+    static let mouseAccent = Color(red: 0.20, green: 0.78, blue: 1.00)
 }
 
 // MARK: - Content View
@@ -402,137 +415,61 @@ struct ContentView: View {
     }
 
     var body: some View {
-        // Fixed width; height is whatever the content needs (see
-        // AppDelegate: sizingStyle .preferredContentSize means the
-        // popover adopts this view's ideal height). No scroll: the
-        // whole panel always fits, regardless of which groups show.
-        VStack(spacing: 10) {
+        VStack(spacing: 0) {
             TitleBar()
-            if let v = store.updateCompleted {
-                UpdatedBanner()
-                let _ = v // shown once per session
-            } else if store.latestVersion != nil {
-                UpdateBanner()
-            } else if store.updateCheckNote != nil {
-                CheckNote()
-            }
+                .padding(.bottom, 12)
+            PanelDivider()
             if !hasKeyboard && !hasMouse {
-                EmptyGroup()
+                EmptyDevices()
             } else {
-                if hasKeyboard { KeyboardGroup() }
-                if hasMouse { MouseGroup() }
-            }
-        }
-        .padding(EdgeInsets(top: 10, leading: 12, bottom: 12, trailing: 12))
-        .frame(width: 340)
-    }
-}
-
-// MARK: - Update banner
-
-/// "vX.Y available" group, in the panel's grouped-settings idiom: inset,
-/// hairline-outlined, yellow accent. One click: download, verify
-/// signature, swap bundles, relaunch.
-private struct UpdateBanner: View {
-    @EnvironmentObject var store: Store
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "arrow.down.circle.fill")
-                .font(.system(size: 14))
-                .foregroundStyle(.yellow)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("v\(store.latestVersion ?? "") available")
-                    .font(.system(size: 12, weight: .semibold))
-                if let err = store.updateError {
-                    Text(err)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
+                if hasKeyboard {
+                    KeyboardGroup()
+                        .padding(.vertical, 13)
+                    if hasMouse { PanelDivider() }
+                }
+                if hasMouse {
+                    MouseGroup()
                 }
             }
-            Spacer()
-            if store.updating {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Button("Update Now") { store.performUpdate() }
-                    .controlSize(.small)
-            }
+            PanelDivider()
+            UpdateFooter()
+                .padding(.top, 14)
         }
-        .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
-        .background(
-            RoundedRectangle(cornerRadius: Theme.groupRadius)
-                .fill(Color.yellow.opacity(0.10))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.groupRadius)
-                .stroke(Color.yellow.opacity(0.30), lineWidth: 1)
-        )
+        .font(.system(size: 13))
+        .foregroundStyle(.white)
+        .padding(EdgeInsets(top: 16, leading: 18, bottom: 16, trailing: 18))
+        .frame(width: 360)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(Theme.background)
+        .environment(\.colorScheme, .dark)
+        .background(GeometryReader { geometry in
+            Color.clear.preference(key: PanelSizeKey.self, value: geometry.size)
+        })
+        .onPreferenceChange(PanelSizeKey.self) { size in
+            // SwiftUI state changes (including the disclosure and errors)
+            // must resize the actual popover as well as its content.
+            NotificationCenter.default.post(
+                name: Notification.Name("razerctlPanelSizeChanged"), object: nil,
+                userInfo: ["size": size])
+        }
     }
 }
 
-// MARK: - Update confirmation
+private struct PanelSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
 
-/// Green "Updated to vX.Y" banner shown by the instance that was just
-/// installed by a self-update. Auto-clears when the panel is closed.
-private struct UpdatedBanner: View {
-    @EnvironmentObject var store: Store
-
+private struct PanelDivider: View {
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 14))
-                .foregroundStyle(.green)
-            Text("Updated to v\(store.updateCompleted ?? "")")
-                .font(.system(size: 12, weight: .semibold))
-            Spacer()
-        }
-        .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
-        .background(
-            RoundedRectangle(cornerRadius: Theme.groupRadius)
-                .fill(Color.green.opacity(0.10))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.groupRadius)
-                .stroke(Color.green.opacity(0.30), lineWidth: 1)
-        )
+        Rectangle().fill(Theme.separator).frame(height: 1)
+            .accessibilityHidden(true)
     }
 }
 
-// MARK: - Check-result note
-
-/// Transient feedback for "Check for Updates…": neutral hairline row,
-/// auto-clears after a few seconds.
-private struct CheckNote: View {
-    @EnvironmentObject var store: Store
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle")
-                .font(.system(size: 14))
-                .foregroundStyle(.secondary)
-            Text(store.updateCheckNote ?? "")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
-        .background(
-            RoundedRectangle(cornerRadius: Theme.groupRadius)
-                .fill(Theme.groupFill(colorScheme))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.groupRadius)
-                .stroke(Theme.separator(colorScheme), lineWidth: 1)
-        )
-        .environment(\.colorScheme, colorScheme)
-    }
-
-    @Environment(\.colorScheme) private var colorScheme
-}
-
-// MARK: - Title bar
+// MARK: - Header and update footer
 
 private struct TitleBar: View {
     @EnvironmentObject var store: Store
@@ -540,10 +477,7 @@ private struct TitleBar: View {
     var body: some View {
         HStack {
             Text("RazerCtl")
-                .font(.system(size: 13, weight: .semibold))
-            Text("v\(Store.appVersion)")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 18, weight: .semibold))
             Spacer()
             Menu {
                 Button("Check for Updates…") { store.checkForUpdates(force: true) }
@@ -553,210 +487,576 @@ private struct TitleBar: View {
                 Button("Quit RazerCtl") { NSApp.terminate(nil) }
                     .keyboardShortcut("q")
             } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 14, weight: .bold))
+                    .frame(width: 28, height: 28)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .fixedSize()
+            .frame(width: 28, height: 28)
+            .background(Color.white.opacity(0.07), in: Circle())
+            .overlay(Circle().strokeBorder(Color.white.opacity(0.13)))
+            .accessibilityLabel("More")
             .help("More")
         }
-        .frame(height: 24)
-        .padding(.leading, 4)
+        .frame(height: 26)
     }
 }
 
-// MARK: - Group building blocks
-
-/// An inset settings group: rounded, hairline-outlined, rows inside.
-private struct SettingsGroup<Content: View>: View {
-    @Environment(\.colorScheme) private var scheme
-    @ViewBuilder let content: Content
+private struct UpdateFooter: View {
+    @EnvironmentObject var store: Store
 
     var body: some View {
-        VStack(spacing: 0) {
-            content
-        }
-        .frame(maxWidth: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: Theme.groupRadius, style: .continuous)
-                .fill(Theme.groupFill(scheme))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.groupRadius, style: .continuous)
-                .strokeBorder(Theme.separator(scheme), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: Theme.groupRadius, style: .continuous))
-    }
-}
-
-/// The first row of a device group: glyph, device name, firmware.
-private struct GroupHeader: View {
-    @Environment(\.colorScheme) private var scheme
-    let icon: String
-    let name: String
-    let detail: String?
-
-    var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16)
-                Text(name)
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                if let detail {
-                    Text(detail)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                if let version = store.updateCompleted {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Updated to v\(version)")
+                } else if let version = store.latestVersion {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 14)).foregroundStyle(.yellow)
+                    Text("v\(version) available").fontWeight(.semibold)
+                    Spacer()
+                    if store.updating {
+                        ProgressView().controlSize(.small)
+                            .accessibilityLabel("Installing update")
+                    } else {
+                        Button("Update") { store.performUpdate() }
+                            .controlSize(.regular)
+                    }
+                } else if let note = store.updateCheckNote {
+                    Image(systemName: "info.circle").foregroundStyle(Theme.secondary)
+                    Text(note).foregroundStyle(Theme.secondary)
+                } else {
+                    Text("v\(Store.appVersion)")
+                        .foregroundStyle(Theme.secondary)
+                    Spacer()
+                    Button("Check for Updates…") { store.checkForUpdates(force: true) }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Theme.secondary)
                 }
             }
-            .frame(height: 32)
-            .padding(.horizontal, 12)
-            Rectangle()
-                .fill(Theme.separator(scheme))
-                .frame(height: 1)
+            .frame(minHeight: 24)
+            if let error = store.updateError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
+        .font(.system(size: 12))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-/// Hairline between two rows, inset from the leading edge like a list.
-private struct RowDivider: View {
-    @Environment(\.colorScheme) private var scheme
+// MARK: - Device lighting
 
-    var body: some View {
-        Rectangle()
-            .fill(Theme.separator(scheme))
-            .frame(height: 1)
-            .padding(.leading, 12)
-    }
-}
+private struct DeviceHeader: View {
+    let icon: String
+    let name: String
+    let kind: String
+    let firmware: String?
 
-/// One settings row: label at the leading edge, control at the trailing edge.
-private struct SettingRow<Control: View>: View {
-    let label: LocalizedStringKey
-    @ViewBuilder let control: Control
-
-    init(_ label: LocalizedStringKey, @ViewBuilder control: () -> Control) {
-        self.label = label
-        self.control = control()
+    private var displayName: String {
+        name.hasPrefix("Razer ") ? String(name.dropFirst(6)) : name
     }
 
     var body: some View {
         HStack(spacing: 12) {
-            Text(label)
-                .lineLimit(1)
-            Spacer(minLength: 12)
-            control
+            Image(systemName: icon)
+                .font(.system(size: 25, weight: .regular))
+                .frame(width: 30)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(displayName)
+                    .font(.system(size: 15, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(kind)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+            }
+            Spacer(minLength: 0)
         }
-        .frame(height: 34)
-        .padding(.horizontal, 12)
+        .help(firmware.map { "\(name) · Firmware \($0)" } ?? name)
     }
 }
 
-// MARK: - Shared rows
-
-private struct EffectPicker: View {
+private struct LightingControls: View {
     @EnvironmentObject var store: Store
     let device: String
-    let effects: [(String, String)]   // (raw command, display name)
+    let effects: [(String, String)]
 
-    var body: some View {
-        // Menu style: four long labels would overflow a segmented control.
-        Picker("Lighting", selection: selectionBinding) {
-            ForEach(effects, id: \.0) { fx in
-                Text(fx.1).tag(fx.0)
-            }
-        }
-        .pickerStyle(.menu)
-        .labelsHidden()
-        .frame(width: 124)
+    private var isStatic: Bool {
+        (device == "keyboard" ? store.kbdEffect : store.mouseEffect) == "static"
     }
 
-    private var selectionBinding: Binding<String> {
-        let device = device
-        let store = store
-        return Binding(
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Text("Lighting")
+                Spacer(minLength: 12)
+                EffectMenu(selection: selection, effects: effects,
+                           label: "\(device.capitalized) lighting")
+                    .frame(width: isStatic ? 112 : 150, height: 28)
+                if isStatic {
+                    ColorWell(device: device)
+                        .frame(width: 26, height: 26)
+                }
+            }
+            .frame(height: 28)
+            BrightnessControl(device: device)
+        }
+    }
+
+    private var selection: Binding<String> {
+        Binding(
             get: { device == "keyboard" ? store.kbdEffect : store.mouseEffect },
-            set: { raw in
-                if device == "keyboard" { store.kbdEffect = raw }
-                else { store.mouseEffect = raw }
-                store.applyEffect(raw, device: device)
+            set: { effect in
+                if device == "keyboard" { store.kbdEffect = effect }
+                else { store.mouseEffect = effect }
+                store.applyEffect(effect, device: device)
             }
         )
     }
 }
 
-private struct ColorWell: View {
-    @EnvironmentObject var store: Store
-    let device: String
+/// NSPopUpButton preserves native menu selection and keyboard support;
+/// its cell places the current effect and disclosure glyph at each end.
+private struct EffectMenu: NSViewRepresentable {
+    @Binding var selection: String
+    let effects: [(String, String)]
+    let label: String
 
-    var body: some View {
-        ColorPicker("Color", selection: colorBinding, supportsOpacity: false)
-            .labelsHidden()
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.cell = EffectMenuCell(textCell: "", pullsDown: false)
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.changed(_:))
+        button.autoenablesItems = false
+        button.setAccessibilityLabel(label)
+        return button
     }
 
-    private var colorBinding: Binding<Color> {
-        let device = device
-        let store = store
-        return Binding(
-            get: { device == "keyboard" ? store.kbdColor : store.mouseColor },
-            set: { store.applyStatic(color: $0, device: device) }
-        )
+    func updateNSView(_ button: NSPopUpButton, context: Context) {
+        context.coordinator.parent = self
+        if button.itemTitles != effects.map(\.1) {
+            button.removeAllItems()
+            for (value, title) in effects {
+                button.addItem(withTitle: title)
+                button.lastItem?.representedObject = value
+            }
+        }
+        if let index = effects.firstIndex(where: { $0.0 == selection }) {
+            button.selectItem(at: index)
+        }
+        button.needsDisplay = true
+    }
+
+    final class Coordinator: NSObject {
+        var parent: EffectMenu
+        init(_ parent: EffectMenu) { self.parent = parent }
+        @objc func changed(_ sender: NSPopUpButton) {
+            if let effect = sender.selectedItem?.representedObject as? String {
+                parent.selection = effect
+            }
+        }
     }
 }
 
-private struct BrightnessRow: View {
+private final class EffectMenuCell: NSPopUpButtonCell {
+    override func draw(withFrame frame: NSRect, in controlView: NSView) {
+        let surface = NSBezierPath(roundedRect: frame.insetBy(dx: 0.5, dy: 0.5),
+                                   xRadius: 6, yRadius: 6)
+        NSColor.white.withAlphaComponent(isHighlighted ? 0.13 : 0.07).setFill()
+        surface.fill()
+        NSColor.white.withAlphaComponent(0.13).setStroke()
+        surface.lineWidth = 1
+        surface.stroke()
+        let text = title as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.white,
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(at: NSPoint(x: frame.minX + 10, y: frame.midY - size.height / 2),
+                  withAttributes: attributes)
+        let arrow = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .medium))?
+            .withSymbolConfiguration(.init(paletteColors: [.white]))
+        arrow?.draw(in: NSRect(x: frame.maxX - 18, y: frame.midY - 6, width: 8, height: 12))
+    }
+
+    override func drawFocusRingMask(withFrame frame: NSRect, in controlView: NSView) {
+        NSBezierPath(roundedRect: frame, xRadius: 6, yRadius: 6).fill()
+    }
+}
+
+/// The system color well keeps the native color panel and keyboard/AX
+/// behavior; its minimal swatch fits beside the effect selector.
+private struct ColorWell: NSViewRepresentable {
     @EnvironmentObject var store: Store
     let device: String
 
-    var body: some View {
-        HStack(spacing: 8) {
-            Text("Brightness")
-                .frame(width: 84, alignment: .leading)
-            Image(systemName: "sun.min")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            // Commits on release only: every command is ~100 ms of device I/O.
-            Slider(value: sliderValue, in: 0...100, step: 1, onEditingChanged: { editing in
-                if !editing { store.setBrightness(value, device: device) }
-            })
-            Image(systemName: "sun.max")
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-            Text("\(Int(value))%")
-                .font(.system(size: 11).monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 34, alignment: .trailing)
-        }
-        .frame(height: 34)
-        .padding(.horizontal, 12)
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> CompactColorWell {
+        let well = CompactColorWell(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
+        if #available(macOS 13.0, *) { well.colorWellStyle = .minimal }
+        well.isBordered = false
+        well.wantsLayer = true
+        well.layer?.cornerRadius = 13
+        well.layer?.masksToBounds = true
+        well.layer?.borderWidth = 1.5
+        well.layer?.borderColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        well.target = context.coordinator
+        well.action = #selector(Coordinator.changed(_:))
+        well.setAccessibilityLabel("\(device.capitalized) static color")
+        return well
     }
+
+    func updateNSView(_ well: CompactColorWell, context: Context) {
+        context.coordinator.parent = self
+        well.color = NSColor(device == "keyboard" ? store.kbdColor : store.mouseColor)
+    }
+
+    final class Coordinator: NSObject {
+        var parent: ColorWell
+        init(_ parent: ColorWell) { self.parent = parent }
+        @objc func changed(_ sender: NSColorWell) {
+            parent.store.applyStatic(color: Color(nsColor: sender.color), device: parent.device)
+        }
+    }
+}
+
+private final class CompactColorWell: NSColorWell {
+    override var intrinsicContentSize: NSSize { NSSize(width: 26, height: 26) }
+}
+
+private struct BrightnessControl: View {
+    @EnvironmentObject var store: Store
+    let device: String
 
     private var value: Double {
         device == "keyboard" ? store.kbdBrightness : store.mouseBrightness
     }
+    private var accent: Color {
+        let effect = device == "keyboard" ? store.kbdEffect : store.mouseEffect
+        if effect == "static" {
+            return device == "keyboard" ? store.kbdColor : store.mouseColor
+        }
+        return device == "keyboard" ? Theme.keyboardAccent : Theme.mouseAccent
+    }
+
+    var body: some View {
+        VStack(spacing: 5) {
+            HStack {
+                Text("Brightness")
+                Spacer()
+                Text("\(Int(value))%")
+                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
+            }
+            BrightnessSlider(value: sliderValue, accent: NSColor(accent),
+                             label: "\(device.capitalized) brightness") { value in
+                store.setBrightness(value, device: device)
+            }
+            .frame(height: 16)
+        }
+    }
 
     private var sliderValue: Binding<Double> {
-        let device = device
-        let store = store
-        return Binding(
-            get: { device == "keyboard" ? store.kbdBrightness : store.mouseBrightness },
-            set: { v in
-                if device == "keyboard" { store.kbdBrightness = v }
-                else { store.mouseBrightness = v }
+        Binding(
+            get: { value },
+            set: { value in
+                if device == "keyboard" { store.kbdBrightness = value }
+                else { store.mouseBrightness = value }
             }
         )
     }
 }
 
-/// Shown inside a device group when the device is present but the core
-/// could not talk to it. A refused HID open on macOS means the Input
-/// Monitoring grant is missing; anything else shows the core's message.
+/// NSSlider retains native keyboard, mouse and accessibility behavior.
+/// The cell supplies the selected color; system SwiftUI sliders on macOS
+/// ignore the tint and display a tick for every percentage step.
+private struct BrightnessSlider: NSViewRepresentable {
+    @Binding var value: Double
+    let accent: NSColor
+    let label: String
+    let commit: (Double) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSSlider {
+        let slider = NSSlider(value: value, minValue: 0, maxValue: 100,
+                              target: context.coordinator, action: #selector(Coordinator.changed(_:)))
+        let cell = BrightnessSliderCell()
+        slider.cell = cell
+        slider.minValue = 0
+        slider.maxValue = 100
+        slider.doubleValue = value
+        slider.isContinuous = true
+        slider.numberOfTickMarks = 0
+        slider.target = context.coordinator
+        slider.action = #selector(Coordinator.changed(_:))
+        slider.setAccessibilityLabel(label)
+        cell.trackingEnded = { [weak coordinator = context.coordinator] slider in
+            coordinator?.parent.commit(slider.doubleValue.rounded())
+        }
+        return slider
+    }
+
+    func updateNSView(_ slider: NSSlider, context: Context) {
+        context.coordinator.parent = self
+        slider.doubleValue = value
+        (slider.cell as? BrightnessSliderCell)?.accent = accent
+        slider.needsDisplay = true
+    }
+
+    final class Coordinator: NSObject {
+        var parent: BrightnessSlider
+        init(_ parent: BrightnessSlider) { self.parent = parent }
+        @objc func changed(_ slider: NSSlider) {
+            let value = slider.doubleValue.rounded()
+            slider.doubleValue = value
+            parent.value = value
+            // Keyboard and accessibility changes commit immediately;
+            // pointer drags publish live UI and commit once on release.
+            if (slider.cell as? BrightnessSliderCell)?.isEditing != true {
+                parent.commit(value)
+            }
+        }
+    }
+}
+
+private final class BrightnessSliderCell: NSSliderCell {
+    var accent = NSColor.controlAccentColor
+    var isEditing = false
+    var trackingEnded: ((NSSlider) -> Void)?
+
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        let bar = NSRect(x: rect.minX, y: rect.midY - 2.5, width: rect.width, height: 5)
+        NSColor.white.withAlphaComponent(0.18).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 2.5, yRadius: 2.5).fill()
+        let fraction = (doubleValue - minValue) / max(1, maxValue - minValue)
+        let filled = NSRect(x: bar.minX, y: bar.minY, width: bar.width * fraction, height: bar.height)
+        accent.setFill()
+        NSBezierPath(roundedRect: filled, xRadius: 2.5, yRadius: 2.5).fill()
+    }
+
+    override func drawKnob(_ rect: NSRect) {
+        let knob = NSRect(x: rect.midX - 8, y: rect.midY - 8, width: 16, height: 16)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: knob).fill()
+    }
+
+    override func startTracking(at startPoint: NSPoint, in controlView: NSView) -> Bool {
+        let started = super.startTracking(at: startPoint, in: controlView)
+        isEditing = started
+        return started
+    }
+
+    override func stopTracking(last lastPoint: NSPoint, current stopPoint: NSPoint,
+                               in controlView: NSView, mouseIsUp flag: Bool) {
+        super.stopTracking(last: lastPoint, current: stopPoint, in: controlView, mouseIsUp: flag)
+        isEditing = false
+        if flag, let slider = controlView as? NSSlider { trackingEnded?(slider) }
+    }
+}
+
+private struct KeyboardGroup: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            DeviceHeader(icon: "keyboard", name: deviceName("keyboard", in: store.status),
+                         kind: "Keyboard", firmware: store.status["keyboard_fw"])
+            if store.status["keyboard"] != nil {
+                LightingControls(device: "keyboard", effects: [
+                    ("spectrum", "Spectrum"), ("breath", "Breath"),
+                    ("static", "Static"), ("none", "Off"),
+                ])
+            } else if let error = store.status["keyboard_error"] {
+                DeviceProblem(error: error)
+            }
+        }
+    }
+}
+
+private struct MouseGroup: View {
+    @EnvironmentObject var store: Store
+    @State private var performanceExpanded = false
+
+    private var summary: String {
+        var items: [String] = []
+        if let dpi = store.status["dpi"] { items.append("\(dpi) DPI") }
+        if let rate = store.status["poll"] { items.append("\(rate) Hz") }
+        if let scroll = store.status["scroll"] {
+            items.append(scroll == "free" ? "Free-spin" : "Tactile")
+        }
+        return items.isEmpty ? "DPI, polling rate and scroll" : items.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 12) {
+                DeviceHeader(icon: "computermouse", name: deviceName("mouse", in: store.status),
+                             kind: "Mouse", firmware: store.status["mouse_fw"])
+                if store.status["mouse"] != nil {
+                    LightingControls(device: "mouse", effects: [
+                        ("spectrum", "Spectrum"), ("wave", "Wave"),
+                        ("rainbow", "Rainbow"), ("static", "Static"), ("none", "Off"),
+                    ])
+                } else if let error = store.status["mouse_error"] {
+                    DeviceProblem(error: error)
+                }
+            }
+            .padding(.vertical, 13)
+            if store.status["mouse"] != nil {
+                PanelDivider()
+                Button {
+                    performanceExpanded.toggle()
+                } label: {
+                    HStack(alignment: .center, spacing: 12) {
+                        Image(systemName: performanceExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Mouse performance")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text(summary)
+                                .font(.system(size: 12).monospacedDigit())
+                                .foregroundStyle(Theme.secondary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Mouse performance")
+                .accessibilityValue(performanceExpanded ? "Expanded, \(summary)" : "Collapsed, \(summary)")
+                .accessibilityHint("Show or hide DPI, polling rate and scroll settings")
+                if performanceExpanded {
+                    MousePerformance()
+                        .padding(.top, 2)
+                        .padding(.bottom, 16)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Mouse performance
+
+private struct MousePerformance: View {
+    @EnvironmentObject var store: Store
+    @State private var customDpi = ""
+    @State private var editingCustomDpi = false
+    @FocusState private var dpiFieldFocused: Bool
+
+    private var stages: [String] {
+        (store.status["stages"] ?? "400,800,1600,3200,6400")
+            .split(separator: ",").map(String.init)
+    }
+    private var isCustomDpi: Bool { !stages.contains(store.status["dpi"] ?? "") }
+    private var validCustomDpi: Bool {
+        guard let value = Int(customDpi.trimmingCharacters(in: .whitespaces)) else { return false }
+        return (1...26000).contains(value)
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("DPI")
+                Spacer()
+                Picker("Mouse DPI preset", selection: dpiSelection) {
+                    ForEach(stages, id: \.self) { Text($0).tag($0) }
+                    Divider()
+                    Text("Custom…").tag("custom")
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 150)
+            }
+            if editingCustomDpi || isCustomDpi {
+                HStack(spacing: 8) {
+                    TextField("Custom DPI", text: $customDpi)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($dpiFieldFocused)
+                        .onSubmit(applyCustomDpi)
+                        .accessibilityLabel("Custom mouse DPI")
+                    Button("Apply", action: applyCustomDpi)
+                        .disabled(!validCustomDpi)
+                }
+                .help("Enter a DPI between 1 and 26000")
+            }
+            HStack {
+                Text("Polling rate")
+                Spacer()
+                Picker("Mouse polling rate", selection: pollSelection) {
+                    Text("125 Hz").tag("125")
+                    Text("500 Hz").tag("500")
+                    Text("1000 Hz").tag("1000")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(width: 192)
+                .help("Report rate — higher means a snappier cursor.")
+            }
+            HStack {
+                Text("Free-spin scroll")
+                Spacer()
+                Toggle("Free-spin scroll", isOn: scrollBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+        }
+        .onReceive(store.$status) { status in
+            if !dpiFieldFocused { customDpi = status["dpi"] ?? "" }
+        }
+    }
+
+    private var dpiSelection: Binding<String> {
+        Binding(
+            get: { editingCustomDpi || isCustomDpi ? "custom" : store.status["dpi"] ?? "custom" },
+            set: { value in
+                editingCustomDpi = value == "custom"
+                if editingCustomDpi {
+                    customDpi = store.status["dpi"] ?? ""
+                    dpiFieldFocused = true
+                } else {
+                    store.setDpi(value)
+                }
+            }
+        )
+    }
+    private var pollSelection: Binding<String> {
+        Binding(get: { store.status["poll"] ?? "500" }, set: { store.setPoll($0) })
+    }
+    private var scrollBinding: Binding<Bool> {
+        Binding(get: { store.status["scroll"] == "free" }, set: { store.setScroll(free: $0) })
+    }
+    private func applyCustomDpi() {
+        guard validCustomDpi else { return }
+        store.setDpi(customDpi.trimmingCharacters(in: .whitespaces))
+        editingCustomDpi = false
+        dpiFieldFocused = false
+    }
+}
+
+// MARK: - Device and empty states
+
+private func deviceName(_ device: String, in status: [String: String]) -> String {
+    if let name = status[device] { return name }
+    if let error = status["\(device)_error"], error.hasPrefix("Razer "),
+       let colon = error.firstIndex(of: ":") {
+        return String(error[..<colon])
+    }
+    return device.capitalized
+}
+
 private struct DeviceProblem: View {
     let error: String
 
@@ -766,228 +1066,43 @@ private struct DeviceProblem: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 13))
+        VStack(alignment: .leading, spacing: 8) {
+            Label(needsInputMonitoring ? "Input Monitoring required" : "Can't reach this device",
+                  systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.orange)
-                .padding(.top, 1)
-            VStack(alignment: .leading, spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(needsInputMonitoring ? "Input Monitoring required" : "Can't reach this device")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(needsInputMonitoring
-                         ? "macOS blocks control of this device until RazerCtl is allowed under Privacy & Security."
-                         : error)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if needsInputMonitoring {
-                    Button("Open System Settings…") { Store.openInputMonitoringSettings() }
-                        .controlSize(.small)
-                }
+            Text(needsInputMonitoring
+                 ? "Allow RazerCtl in Privacy & Security to control this device."
+                 : error)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if needsInputMonitoring {
+                Button("Open System Settings…") { Store.openInputMonitoringSettings() }
+                    .controlSize(.small)
             }
-            Spacer(minLength: 0)
         }
-        .padding(EdgeInsets(top: 10, leading: 12, bottom: 12, trailing: 12))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .help(error)
     }
 }
 
-/// The core's error lines start with the device's name ("Razer Basilisk V3: …").
-private func deviceName(fromError error: String) -> String? {
-    guard error.hasPrefix("Razer "), let colon = error.firstIndex(of: ":") else { return nil }
-    return String(error[..<colon])
-}
-
-// MARK: - Keyboard group
-
-private struct KeyboardGroup: View {
-    @EnvironmentObject var store: Store
-
-    private var name: String {
-        store.status["keyboard"]
-            ?? store.status["keyboard_error"].flatMap(deviceName(fromError:))
-            ?? "Keyboard"
-    }
-
+private struct EmptyDevices: View {
     var body: some View {
-        SettingsGroup {
-            GroupHeader(icon: "keyboard", name: name,
-                        detail: store.status["keyboard_fw"].map { "fw \($0)" })
-            if store.status["keyboard"] != nil {
-                SettingRow("Lighting") {
-                    EffectPicker(device: "keyboard", effects: [
-                        ("spectrum", "Spectrum"),
-                        ("breath", "Breath"),
-                        ("none", "Off"),
-                    ])
-                }
-                RowDivider()
-                SettingRow("Color") {
-                    ColorWell(device: "keyboard")
-                }
-                RowDivider()
-                BrightnessRow(device: "keyboard")
-            } else if let err = store.status["keyboard_error"] {
-                DeviceProblem(error: err)
-            }
+        VStack(spacing: 8) {
+            Image(systemName: "keyboard")
+                .font(.system(size: 28, weight: .regular))
+                .foregroundStyle(Theme.secondary)
+            Text("No Razer devices detected")
+                .font(.system(size: 14, weight: .semibold))
+            Text("Plug in your Razer keyboard or mouse, then open RazerCtl again.")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
-    }
-}
-
-// MARK: - Mouse group
-
-private struct MouseGroup: View {
-    @EnvironmentObject var store: Store
-    @State private var customDpi = ""
-    @FocusState private var dpiFieldFocused: Bool
-
-    private var name: String {
-        store.status["mouse"]
-            ?? store.status["mouse_error"].flatMap(deviceName(fromError:))
-            ?? "Mouse"
-    }
-
-    private var stages: [String] {
-        (store.status["stages"] ?? "400,800,1600,3200,6400")
-            .split(separator: ",").map(String.init)
-    }
-
-    private var isCustomDpi: Bool {
-        let dpi = store.status["dpi"] ?? ""
-        return !stages.contains(dpi)
-    }
-
-    private var dpiSelection: Binding<String> {
-        let stages = stages
-        let store = store
-        return Binding(
-            get: {
-                let dpi = store.status["dpi"] ?? ""
-                return stages.contains(dpi) ? dpi : "custom"
-            },
-            set: { raw in
-                if raw != "custom" { store.setDpi(raw) }
-            }
-        )
-    }
-
-    private var pollSelection: Binding<String> {
-        let store = store
-        return Binding(
-            get: { store.status["poll"] ?? "500" },
-            set: { store.setPoll($0) }
-        )
-    }
-
-    private var scrollBinding: Binding<Bool> {
-        let store = store
-        return Binding(
-            get: { store.status["scroll"] == "free" },
-            set: { store.setScroll(free: $0) }
-        )
-    }
-
-    var body: some View {
-        SettingsGroup {
-            GroupHeader(icon: "computermouse", name: name,
-                        detail: store.status["mouse_fw"].map { "fw \($0)" })
-
-            if store.status["mouse"] != nil {
-                SettingRow("DPI") {
-                    Picker("DPI", selection: dpiSelection) {
-                        ForEach(stages, id: \.self) { Text($0).tag($0) }
-                        Divider()
-                        Text("Custom…").tag("custom")
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .frame(width: 124)
-                }
-                if isCustomDpi {
-                    RowDivider()
-                    SettingRow("Custom DPI") {
-                        HStack(spacing: 8) {
-                            // Placeholder = the value the device reports now.
-                            TextField(store.status["dpi"] ?? "e.g. 1800", text: $customDpi)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 96)
-                                .focused($dpiFieldFocused)
-                                .onSubmit(applyCustomDpi)
-                            Button("Apply", action: applyCustomDpi)
-                                .controlSize(.small)
-                        }
-                    }
-                }
-                RowDivider()
-                SettingRow("Polling rate") {
-                    Picker("Polling rate", selection: pollSelection) {
-                        Text("125 Hz").tag("125")
-                        Text("500 Hz").tag("500")
-                        Text("1000 Hz").tag("1000")
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 186)
-                    .help("Report rate — higher means a snappier cursor.")
-                }
-                RowDivider()
-                SettingRow("Lighting") {
-                    EffectPicker(device: "mouse", effects: [
-                        ("spectrum", "Spectrum"),
-                        ("wave", "Wave"),
-                        ("rainbow", "Rainbow"),
-                        ("none", "Off"),
-                    ])
-                }
-                RowDivider()
-                SettingRow("Color") {
-                    ColorWell(device: "mouse")
-                }
-                RowDivider()
-                BrightnessRow(device: "mouse")
-                RowDivider()
-                SettingRow("Free-spin scroll wheel") {
-                    Toggle("Free-spin scroll wheel", isOn: scrollBinding)
-                        .toggleStyle(.switch)
-                        .labelsHidden()
-                }
-            } else if let err = store.status["mouse_error"] {
-                DeviceProblem(error: err)
-            }
-        }
-    }
-
-    private func applyCustomDpi() {
-        let v = customDpi.trimmingCharacters(in: .whitespaces)
-        guard Int(v) != nil else { return }
-        store.setDpi(v)
-        dpiFieldFocused = false
-    }
-}
-
-// MARK: - Empty state
-
-private struct EmptyGroup: View {
-    var body: some View {
-        SettingsGroup {
-            VStack(spacing: 6) {
-                Image(systemName: "keyboard")
-                    .font(.system(size: 26, weight: .light))
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 4)
-                Text("No Razer devices detected")
-                    .font(.system(size: 13, weight: .semibold))
-                Text("Plug in your Razer keyboard or mouse, then open RazerCtl again.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(EdgeInsets(top: 28, leading: 20, bottom: 28, trailing: 20))
-        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
     }
 }
 
@@ -1038,12 +1153,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // again.
         popover.behavior = .applicationDefined
         popover.animates = true
+        popover.appearance = NSAppearance(named: .darkAqua)
         let host = NSHostingController(
             rootView: AnyView(ContentView().environmentObject(store))
         )
         // .preferredContentSize: the popover sizes itself to the SwiftUI
         // content's ideal size — no fixed height, no scroll.
         host.sizingOptions = .preferredContentSize
+        host.view.appearance = NSAppearance(named: .darkAqua)
         hosting = host
         popover.contentViewController = host
 
@@ -1053,6 +1170,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forName: Notification.Name("razerctlStatusUpdated"),
             object: nil, queue: .main) { [weak self] _ in
             self?.syncSize()
+        }
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("razerctlPanelSizeChanged"),
+            object: nil, queue: .main) { [weak self] notification in
+            guard let size = notification.userInfo?["size"] as? CGSize,
+                  size.width > 0, size.height > 0 else { return }
+            self?.popover.contentSize = size
         }
 
         store.refresh()
