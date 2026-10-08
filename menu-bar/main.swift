@@ -43,6 +43,9 @@ final class Store: ObservableObject {
     @Published var latestVersion: String?
     @Published var updating = false
     @Published var updateError: String?
+    /// Set after a self-update: the new instance shows a green
+    /// "Updated to vX.Y" confirmation banner.
+    @Published var updateCompleted: String?
     private var assetURL: URL?
     private let repo = "adrianhurtado88/razerctl"
 
@@ -132,7 +135,10 @@ final class Store: ObservableObject {
                 try Self.runCmd("/usr/bin/xattr",
                                  ["-dr", "com.apple.quarantine", bundle])
                 // 6. Launch the new version, then exit this one. The new
-                //    instance deletes the .old bundle at startup.
+                //    instance deletes the .old bundle, clears the download
+                //    temp dir, and shows an "Updated" confirmation.
+                UserDefaults.standard.set(self?.latestVersion ?? Self.appVersion,
+                                          forKey: "didSelfUpdateTo")
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: bundle + "/Contents/MacOS/RazerCtl")
                 try p.run()
@@ -385,7 +391,10 @@ struct ContentView: View {
         // whole panel always fits, regardless of which groups show.
         VStack(spacing: 10) {
             TitleBar()
-            if store.latestVersion != nil {
+            if let v = store.updateCompleted {
+                UpdatedBanner()
+                let _ = v // shown once per session
+            } else if store.latestVersion != nil {
                 UpdateBanner()
             }
             if !hasKeyboard && !hasMouse {
@@ -444,6 +453,34 @@ private struct UpdateBanner: View {
     }
 }
 
+// MARK: - Update confirmation
+
+/// Green "Updated to vX.Y" banner shown by the instance that was just
+/// installed by a self-update. Auto-clears when the panel is closed.
+private struct UpdatedBanner: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(.green)
+            Text("Updated to v\(store.updateCompleted ?? "")")
+                .font(.system(size: 12, weight: .semibold))
+            Spacer()
+        }
+        .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
+        .background(
+            RoundedRectangle(cornerRadius: Theme.groupRadius)
+                .fill(Color.green.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.groupRadius)
+                .stroke(Color.green.opacity(0.30), lineWidth: 1)
+        )
+    }
+}
+
 // MARK: - Title bar
 
 private struct TitleBar: View {
@@ -451,6 +488,9 @@ private struct TitleBar: View {
         HStack {
             Text("RazerCtl")
                 .font(.system(size: 13, weight: .semibold))
+            Text("v\(Store.appVersion)")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
             Spacer()
             Menu {
                 Button("About RazerCtl") { Store.showAbout() }
@@ -924,10 +964,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
 
         // Self-update housekeeping: remove the replaced bundle left by a
-        // previous update (this instance is already running from it).
+        // previous update (this instance is already running from it) and
+        // any download temp dirs.
         let oldBundle = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
             + "/RazerCtl.old.app"
         try? FileManager.default.removeItem(atPath: oldBundle)
+        let tmp = NSTemporaryDirectory()
+        if let leftovers = try? FileManager.default.contentsOfDirectory(atPath: tmp) {
+            for item in leftovers where item.hasPrefix("razerctl-update-") {
+                try? FileManager.default.removeItem(atPath: tmp + item)
+            }
+        }
 
         // .applicationDefined: stays open when focus moves elsewhere —
         // .transient auto-dismisses on ANY focus change, which made the
@@ -955,11 +1002,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         store.refresh()
         store.checkForUpdates()
+
+        // If this instance was just installed by a self-update, show the
+        // confirmation and open the panel automatically.
+        if let updatedTo = UserDefaults.standard.string(forKey: "didSelfUpdateTo") {
+            UserDefaults.standard.removeObject(forKey: "didSelfUpdateTo")
+            store.updateCompleted = updatedTo
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.showPanel()
+            }
+        }
+    }
+
+    /// Show the popover (used by the post-update confirmation).
+    private func showPanel() {
+        guard !popover.isShown, let button = statusItem?.button else { return }
+        store.refresh()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.syncSize()
+        }
     }
 
     @objc private func togglePopover() {
         if popover.isShown {
             popover.performClose(nil)
+            store.updateCompleted = nil // confirmation shows once
         } else if let button = statusItem?.button {
             store.refresh()
             store.checkForUpdates()
