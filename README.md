@@ -9,9 +9,8 @@ check for and download updates.
 
 <img src="docs/design/lighting-first/preview.png" alt="RazerCtl lighting panel showing keyboard and mouse brightness controls and mouse performance settings" width="360">
 
-*Native lighting-panel preview with sample values. Product photos and the
-keyboard/mouse customisers were added after v1.4 and are available in
-[source builds](#build-from-source).*
+*Native lighting-panel preview from before v1.5, with sample values. Version
+1.5 adds product photos and keyboard/mouse customisers.*
 
 ## Supported devices
 
@@ -56,8 +55,8 @@ of these USB control profiles.
 
 ## Install
 
-The v1.4 download is an **Apple silicon** build. Source builds have been checked
-on macOS 27; older macOS versions and Intel builds are unverified.
+The v1.5 download is an **Apple silicon** build for **macOS 27 or later**.
+Intel builds and builds for older macOS versions are unverified.
 
 ### Download the app
 
@@ -74,8 +73,9 @@ xattr -dr com.apple.quarantine /Applications/RazerCtl.app
 open /Applications/RazerCtl.app
 ```
 
-Product photos and the custom keyboard/mouse editors are newer than v1.4. Build
-from source to use them if your downloaded release does not include them.
+Product photos and the custom keyboard/mouse editors are included starting with
+v1.5. Existing installations can choose **Check for Updates…** from the app's
+More menu to get the new release.
 
 ### Build from source
 
@@ -216,7 +216,7 @@ in the [Development notes](docs/DEVNOTES.md).
 **Custom shortcuts or mouse assignments do nothing** — check Accessibility,
 make sure the assignment is enabled and its editor is not paused, and look for
 the error shown in the editor. Choose **Retry** in the mouse editor after changing
-its permission. These editors are not included in v1.4.
+its permission. These editors require v1.5 or later.
 
 **Building inside an iCloud-synced folder** — app bundles assembled there get
 corrupted by sync xattrs; `build-widget.sh` assembles in `$TMPDIR` to avoid
