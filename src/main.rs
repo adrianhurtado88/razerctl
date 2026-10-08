@@ -14,35 +14,37 @@ const USAGE: &str = "\
 razerctl — control your Razer peripherals without Synapse
 
 USAGE:
-  razerctl list                          Show detected Razer devices
-  razerctl info                          Show firmware + current settings
+  razerctl list                          Show detected devices
+  razerctl info                          Firmware + current settings (human)
+  razerctl status                        Same, machine-readable key=value
 
-  razerctl dpi <x> [<y>]                 Set mouse DPI (defaults y = x)
+  razerctl dpi <x> [<y>]                  Set mouse DPI (defaults y = x)
   razerctl stages <v1,v2,...> [active]   Set onboard DPI stages (2-5 values),
-                                         e.g. `stages 400,800,1600,3200 1`
+                                         e.g. `stages 400,800,1600 2`
   razerctl poll <125|500|1000>           Set mouse polling rate (Hz)
-  razerctl scroll <tactile|free>         Basilisk scroll mode
+  razerctl scroll <tactile|free>         Basilisk scroll-wheel mode
 
-  razerctl effect <name> [args]          Set lighting effect on all devices
-  razerctl brightness <0-100>             Set lighting brightness
+  razerctl effect <name> [args]          Set a lighting effect
+  razerctl brightness <0-100>            Set lighting brightness
+  razerctl zones <c1,c2,...>             Mouse only: per-zone static colors
+                                         (2-11 zones), e.g. `zones FF0000,00FF00`
+  razerctl rainbow [n]                   Mouse only: static rainbow over n zones
+  razerctl probe                         Transport diagnostics (safe: control
+                                         collections only, firmware query only)
 
-EFFECTS:
-  none                                   Lights off
-  static <RRGGBB>                        Solid color, e.g. `static 00FF88`
-  spectrum                               Rainbow cycling
-  wave [left|right]                      Moving wave (keyboard)
-  breath                                 Slow fade, cycling colors
-  breath-single <RRGGBB>                 Slow fade on one color
+EFFECTS (per device — the hardware refuses the rest):
+  mouse:      spectrum · static <RRGGBB> · wave [left|right] · none
+  keyboard:   spectrum · static <RRGGBB> · breath · breath-single <RRGGBB> · none
 
-OPTIONS (for effect/brightness):
-  --led <all|scroll|logo|backlight>      Target a specific LED zone
+OPTIONS:
   --dev <keyboard|mouse>                 Target one device only
+  --led <all|scroll|logo>                Mouse brightness target
 
 EXAMPLES:
   razerctl dpi 1600
-  razerctl effect static FF00AA
+  razerctl effect static FF00AA --dev mouse
   razerctl effect wave right
-  razerctl effect spectrum --led scroll
+  razerctl rainbow 11
   razerctl brightness 42
 ";
 
@@ -326,10 +328,15 @@ fn cmd_stages(handles: &[Handle], args: &[&str]) -> Result<String, String> {
         return Err("provide between 2 and 5 DPI stages".into());
     }
     let active: u8 = match args.get(1) {
-        Some(v) => v
-            .parse::<u8>()
-            .map_err(|_| "active stage must be a number".to_string())?
-            - 1,
+        Some(v) => {
+            let n = v
+                .parse::<u8>()
+                .map_err(|_| "active stage must be a number".to_string())?;
+            // Stages are 1-based on the wire; guard the 0 case instead of
+            // underflowing (which panics in debug builds).
+            n.checked_sub(1)
+                .ok_or("active stage must be 1 or greater")?
+        }
         None => 0,
     };
     if active as usize >= stages.len() {
