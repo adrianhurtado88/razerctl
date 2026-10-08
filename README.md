@@ -37,6 +37,8 @@ a small profile addition — see [Development notes](docs/DEVNOTES.md).
 
 **The app**
 - Native SwiftUI panel with per-device sections
+- Custom keyboard shortcuts: send another shortcut, open an app, or open a website
+- Mouse button assignments with recording, individual enable controls and pause
 - All device I/O on a serial background queue — the UI never blocks
 - Self-updating: checks this repo's releases and installs them in one click
   (signature-verified; the macOS privacy grant survives updates)
@@ -68,6 +70,52 @@ git clone https://github.com/adrianhurtado88/razerctl && cd razerctl
 ./build-widget.sh
 open "${TMPDIR}RazerCtl.app"
 ```
+
+## Custom keyboard shortcuts
+
+Choose **Customise shortcuts…** under the keyboard, or **Keyboard Shortcuts…**
+from the app's More menu. Add an assignment, record its trigger, choose an
+action, and save. Use a function key such as F6, or a combination containing
+Command, Control or Option; ordinary typing keys cannot be captured alone.
+F1–F12 may require holding Fn, depending on your Mac's keyboard settings.
+
+Assignments work across **all Mac keyboards while RazerCtl is running**. They
+are stored locally on this Mac, not in the Ornata's onboard memory. No key
+assignments are created by default. You can disable individual assignments,
+pause them all, or delete them; quitting RazerCtl releases its shortcuts.
+
+**Send a shortcut** needs RazerCtl enabled in System Settings → Privacy &
+Security → **Accessibility**. Use **Allow Accessibility…** in the editor to
+open that setting. Opening an app or website does not need this additional
+permission. Sent shortcuts go to the active app after you release the trigger's
+modifier keys; changing the active app during that wait cancels the action.
+
+The editor reports shortcuts reserved by macOS or another app, prevents
+duplicate assignments and shortcut loops, and pauses assignments while
+recording keys. This version supports shortcuts and actions, not multi-step
+macros or per-device firmware remapping.
+
+## Custom mouse buttons
+
+Choose **Customise buttons…** under the mouse, or **Mouse Buttons…** from the
+More menu. Add an assignment, choose Middle click or a side button, or use
+**Record a mouse button…** to identify an extra button. Choose a keyboard
+shortcut, installed app or HTTP(S) website and save. Assignments are saved on
+this Mac and apply to **all Mac mice while RazerCtl is running**.
+
+Mouse assignments need **Accessibility** access to replace the original click.
+The editor has **Allow Accessibility…** and **Retry** controls. Recording
+pauses assigned actions, captures one button, and ends after ten seconds if no
+button is detected. An assigned click runs once on release and its original
+click is suppressed. Disabling, pausing or deleting an assignment restores
+ordinary button behavior; quitting the app removes its mouse handling.
+
+Left and right clicks are preserved. Only middle, side and extra button-click
+events exposed by macOS are supported. DPI, scroll-mode and wheel-tilt controls
+that do not emit such events need separate hardware support; the app does not
+rewrite the mouse's onboard button mappings or pretend to detect these controls.
+Use recording to check each physical button rather than assuming its identity
+from its position. The existing DPI and scroll-mode settings remain available.
 
 ## CLI reference
 

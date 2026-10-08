@@ -24,7 +24,7 @@ CORE="$APP/Contents/MacOS/razerctl-core"
 GUI="$APP/Contents/MacOS/RazerCtl"
 cp target/release/razerctl "$CORE"
 cp menu-bar/Info.plist "$APP/Contents/Info.plist"
-swiftc -O -o "$GUI" menu-bar/main.swift
+swiftc -O -o "$GUI" menu-bar/*.swift
 
 echo "==> App icon"
 # Build the complete macOS icon set from the approved 1024px source.
