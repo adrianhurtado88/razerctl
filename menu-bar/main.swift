@@ -574,6 +574,27 @@ private struct UpdateFooter: View {
 
 // MARK: - Device lighting
 
+private enum ProductArtwork {
+    // Match complete model names so a different generation keeps its
+    // generic symbol instead of showing the wrong product photo.
+    private static let filenames = [
+        "Razer Ornata V3 X": "ornata-v3-x",
+        "Razer Basilisk V3": "basilisk-v3",
+    ]
+
+    private static let images: [String: NSImage] = filenames.reduce(into: [:]) { images, entry in
+        guard let url = Bundle.main.url(forResource: entry.value, withExtension: "png",
+                                        subdirectory: "Devices"),
+              let image = NSImage(contentsOf: url), image.isValid else { return }
+        image.isTemplate = false
+        images[entry.key] = image
+    }
+
+    static func image(for modelName: String) -> NSImage? {
+        images[modelName]
+    }
+}
+
 private struct DeviceHeader: View {
     let icon: String
     let name: String
@@ -586,10 +607,19 @@ private struct DeviceHeader: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 25, weight: .regular))
-                .frame(width: 30)
-                .accessibilityHidden(true)
+            Group {
+                if let image = ProductArtwork.image(for: name) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 25, weight: .regular))
+                }
+            }
+            .frame(width: 64, height: 52)
+            .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(displayName)
                     .font(.system(size: 15, weight: .semibold))

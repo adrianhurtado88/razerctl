@@ -37,6 +37,7 @@ a small profile addition — see [Development notes](docs/DEVNOTES.md).
 
 **The app**
 - Native SwiftUI panel with per-device sections
+- Product photos for known models, with stock device symbols when artwork is unavailable
 - Custom keyboard shortcuts: send another shortcut, open an app, or open a website
 - Mouse button assignments with recording, individual enable controls and pause
 - All device I/O on a serial background queue — the UI never blocks
