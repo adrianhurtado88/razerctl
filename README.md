@@ -49,8 +49,8 @@ Requires macOS 12+ (untested below 13).
 **From the release** (no build tools needed):
 
 ```sh
-curl -LO https://github.com/adrianhurtado88/razerctl/releases/latest/download/RazerCtl-v1.1.zip
-unzip RazerCtl-v1.1.zip
+curl -LO https://github.com/adrianhurtado88/razerctl/releases/latest/download/RazerCtl-v1.3.zip
+unzip RazerCtl-v1.3.zip
 mv RazerCtl.app /Applications/
 xattr -dr com.apple.quarantine RazerCtl.app
 open RazerCtl.app
