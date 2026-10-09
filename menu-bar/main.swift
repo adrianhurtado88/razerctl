@@ -9,17 +9,151 @@
 
 import SwiftUI
 import AppKit
+import Carbon
 
 // MARK: - Store
 
 final class Store: ObservableObject {
     @Published var status: [String: String] = [:]
+
+    /// nil means the panel is not currently checking macOS's secure-input
+    /// status. This query returns a system-wide flag, not keyboard events.
+    @Published private(set) var secureKeyboardEntryEnabled: Bool?
+    @Published private(set) var temporaryKeyboardPrivacyEnabled = false
+    @Published private(set) var temporaryKeyboardPrivacySecondsRemaining = 0
+    @Published private(set) var keyboardPrivacyError: String?
+    static let keyboardPrivacyDuration: TimeInterval = 10 * 60
+    private let secureInputStatus: () -> Bool
+    private let enableSecureInput: () -> OSStatus
+    private let disableSecureInput: () -> OSStatus
+    private let privacyUptime: () -> TimeInterval
+    private let beginPrivacyActivity: (ProcessInfo.ActivityOptions) -> NSObjectProtocol
+    private let endPrivacyActivity: (NSObjectProtocol) -> Void
+    private var keyboardPrivacyActivity: NSObjectProtocol?
+    private var keyboardPrivacyTimer: Timer?
+    private var keyboardPrivacyPanelVisible = false
+    private var keyboardPrivacyDeadline: TimeInterval?
+
+    deinit {
+        keyboardPrivacyTimer?.invalidate()
+        if temporaryKeyboardPrivacyEnabled {
+            // Release exactly the request owned by this Store. Carbon's
+            // secure-input APIs must be called on the main thread.
+            let release = disableSecureInput
+            let activity = keyboardPrivacyActivity
+            let endActivity = endPrivacyActivity
+            let cleanup = {
+                _ = release()
+                if let activity { endActivity(activity) }
+            }
+            if Thread.isMainThread { cleanup() }
+            else { DispatchQueue.main.async(execute: cleanup) }
+        }
+    }
+
+    func startKeyboardPrivacyMonitoring() {
+        precondition(Thread.isMainThread)
+        keyboardPrivacyPanelVisible = true
+        refreshKeyboardPrivacy()
+    }
+
+    func stopKeyboardPrivacyMonitoring() {
+        precondition(Thread.isMainThread)
+        keyboardPrivacyPanelVisible = false
+        refreshKeyboardPrivacy()
+    }
+
+    func setTemporaryKeyboardPrivacyEnabled(_ enabled: Bool) {
+        precondition(Thread.isMainThread)
+        keyboardPrivacyError = nil
+        if enabled {
+            // Enable/disable are reference counted by macOS. Acquiring
+            // once and releasing only our own request preserves other apps.
+            guard !temporaryKeyboardPrivacyEnabled else { return }
+            guard enableSecureInput() == noErr else {
+                keyboardPrivacyError = "Couldn't turn on temporary privacy. Try again."
+                refreshKeyboardPrivacy()
+                return
+            }
+            // The shutoff must keep running after the panel closes. Prevent
+            // App Nap while we own secure input, without preventing Mac sleep.
+            keyboardPrivacyActivity = beginPrivacyActivity(.userInitiatedAllowingIdleSystemSleep)
+            temporaryKeyboardPrivacyEnabled = true
+            keyboardPrivacyDeadline = privacyUptime() + Self.keyboardPrivacyDuration
+        } else {
+            releaseTemporaryKeyboardPrivacy()
+        }
+        refreshKeyboardPrivacy()
+    }
+
+    private func releaseTemporaryKeyboardPrivacy() {
+        guard temporaryKeyboardPrivacyEnabled else { return }
+        guard disableSecureInput() == noErr else {
+            keyboardPrivacyError = "Couldn't turn off temporary privacy. Try again or quit RazerCtl."
+            return
+        }
+        if let activity = keyboardPrivacyActivity {
+            endPrivacyActivity(activity)
+            keyboardPrivacyActivity = nil
+        }
+        temporaryKeyboardPrivacyEnabled = false
+        keyboardPrivacyDeadline = nil
+        temporaryKeyboardPrivacySecondsRemaining = 0
+        keyboardPrivacyError = nil
+    }
+
+    private func refreshKeyboardPrivacy() {
+        // Carbon documents this API as not thread safe: all queries stay
+        // on the main thread, including the common-mode timer callback.
+        precondition(Thread.isMainThread)
+        if let deadline = keyboardPrivacyDeadline {
+            let remaining = max(0, Int(ceil(deadline - privacyUptime())))
+            if temporaryKeyboardPrivacySecondsRemaining != remaining {
+                temporaryKeyboardPrivacySecondsRemaining = remaining
+            }
+            if remaining == 0 { releaseTemporaryKeyboardPrivacy() }
+        }
+        guard keyboardPrivacyPanelVisible || temporaryKeyboardPrivacyEnabled else {
+            keyboardPrivacyTimer?.invalidate()
+            keyboardPrivacyTimer = nil
+            secureKeyboardEntryEnabled = nil
+            return
+        }
+        let enabled = secureInputStatus()
+        if secureKeyboardEntryEnabled != enabled {
+            secureKeyboardEntryEnabled = enabled
+        }
+        if keyboardPrivacyTimer == nil {
+            // Keep the deadline running when the panel is closed. Use a
+            // monotonic clock so wall-clock changes cannot extend a session.
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                self?.refreshKeyboardPrivacy()
+            }
+            timer.tolerance = 0.2
+            keyboardPrivacyTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
     let shortcuts = KeyboardShortcutsStore()
     let mouseButtons = MouseButtonsStore()
     private var shortcutsWindow: KeyboardShortcutsWindow?
     private var mouseButtonsWindow: MouseButtonsWindow?
 
-    init() {
+    init(secureInputStatus: @escaping () -> Bool = { IsSecureEventInputEnabled() },
+         enableSecureInput: @escaping () -> OSStatus = { EnableSecureEventInput() },
+         disableSecureInput: @escaping () -> OSStatus = { DisableSecureEventInput() },
+         privacyUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         beginPrivacyActivity: @escaping (ProcessInfo.ActivityOptions) -> NSObjectProtocol = {
+             ProcessInfo.processInfo.beginActivity(options: $0, reason: "Turn off temporary keyboard privacy on time")
+         },
+         endPrivacyActivity: @escaping (NSObjectProtocol) -> Void = { ProcessInfo.processInfo.endActivity($0) }) {
+        self.secureInputStatus = secureInputStatus
+        self.enableSecureInput = enableSecureInput
+        self.disableSecureInput = disableSecureInput
+        self.privacyUptime = privacyUptime
+        self.beginPrivacyActivity = beginPrivacyActivity
+        self.endPrivacyActivity = endPrivacyActivity
         let keyboard = shortcuts
         mouseButtons.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
     }
@@ -490,6 +624,108 @@ private struct PanelDivider: View {
     }
 }
 
+// MARK: - Keyboard privacy
+
+private struct KeyboardPrivacySection: View {
+    @ObservedObject var privacyStore: Store
+    @State private var showsDetails = false
+
+    private var statusText: String {
+        if privacyStore.temporaryKeyboardPrivacyEnabled {
+            let seconds = privacyStore.temporaryKeyboardPrivacySecondsRemaining
+            if seconds == 0 { return "Turning off…" }
+            return String(format: "On · %d:%02d remaining", seconds / 60, seconds % 60)
+        }
+        switch privacyStore.secureKeyboardEntryEnabled {
+        case true?: return "Enabled by another app"
+        case false?: return "Off · 10-minute limit"
+        case nil: return "Checking status…"
+        }
+    }
+
+    private var temporaryPrivacy: Binding<Bool> {
+        Binding(get: { privacyStore.temporaryKeyboardPrivacyEnabled },
+                set: { privacyStore.setTemporaryKeyboardPrivacyEnabled($0) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            PanelDivider()
+            HStack(spacing: 8) {
+                Image(systemName: privacyStore.secureKeyboardEntryEnabled == true ? "lock.fill" : "lock.open")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(privacyStore.secureKeyboardEntryEnabled == true ? Color.white : Theme.secondary)
+                    .frame(width: 20, height: 24)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Secure Keyboard Entry")
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+                    Text(statusText)
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Secure Keyboard Entry")
+                .accessibilityValue(statusText)
+                Button { showsDetails.toggle() } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 14))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.secondary)
+                .accessibilityLabel("About keyboard privacy")
+                .help("About keyboard privacy")
+                .popover(isPresented: $showsDetails, arrowEdge: .trailing) {
+                    KeyboardPrivacyDetails()
+                }
+                Toggle("Temporary keyboard privacy", isOn: temporaryPrivacy)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .accessibilityHint("Enables Secure Keyboard Entry for up to ten minutes. Open About keyboard privacy for limitations.")
+                    .help("Enable temporary keyboard privacy for ten minutes")
+            }
+            .frame(minHeight: 40)
+
+            if let error = privacyStore.keyboardPrivacyError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 28)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct KeyboardPrivacyDetails: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("About keyboard privacy")
+                .font(.system(size: 14, weight: .semibold))
+            Text("RazerCtl cannot guarantee completely untraceable typing. The app receiving your typing can still read or save it, including in command history.")
+            Text("Temporary mode enables macOS Secure Keyboard Entry for up to 10 minutes. It stays on when this panel closes and turns off on sleep, user switching or quitting RazerCtl.")
+            Text("It may interrupt keyboard shortcuts, remapping and accessibility tools. Turn it off if they stop working.")
+            Text("Turning off this switch releases only RazerCtl’s request. Protection enabled by another app can remain active.")
+            Text("RazerCtl does not keep a typing log. Apple recommends enabling secure input in the app receiving sensitive typing; in Terminal, choose Terminal → Secure Keyboard Entry.")
+            Link("Read Apple’s guide", destination: URL(string: "https://support.apple.com/guide/terminal/use-secure-keyboard-entry-trml109/mac")!)
+        }
+        .font(.system(size: 12))
+        .foregroundStyle(.white)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(16)
+        .frame(width: 310, alignment: .leading)
+        .background(Theme.background)
+        .environment(\.colorScheme, .dark)
+    }
+}
+
 // MARK: - Header and update footer
 
 private struct TitleBar: View {
@@ -501,6 +737,10 @@ private struct TitleBar: View {
                 .font(.system(size: 18, weight: .semibold))
             Spacer()
             Menu {
+                if store.temporaryKeyboardPrivacyEnabled {
+                    Button("Turn Off Temporary Privacy") { store.setTemporaryKeyboardPrivacyEnabled(false) }
+                    Divider()
+                }
                 Button("Check for Updates…") { store.checkForUpdates(force: true) }
                 Button("Keyboard Shortcuts…") { store.showKeyboardShortcuts() }
                 Button("Mouse Buttons…") { store.showMouseButtons() }
@@ -932,6 +1172,7 @@ private struct KeyboardGroup: View {
             } else if let error = store.status["keyboard_error"] {
                 DeviceProblem(error: error)
             }
+            KeyboardPrivacySection(privacyStore: store)
         }
     }
 }
@@ -1163,11 +1404,12 @@ private struct EmptyDevices: View {
 
 // MARK: - App bootstrap
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let store = Store()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
     private var hosting: NSHostingController<AnyView>?
+    private var privacyCleanupObservers: [NSObjectProtocol] = []
 
     /// Keep the popover sized to the SwiftUI content's ideal size.
     /// Status loads asynchronously (~30 ms) after launch — the panel would
@@ -1207,6 +1449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // took focus. Close via the menu-bar button, Esc, or clicking it
         // again.
         popover.behavior = .applicationDefined
+        popover.delegate = self
         popover.animates = true
         popover.appearance = NSAppearance(named: .darkAqua)
         let host = NSHostingController(
@@ -1239,6 +1482,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.shortcuts.start()
         store.mouseButtons.start()
 
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
+                     NSWorkspace.sessionDidResignActiveNotification] {
+            privacyCleanupObservers.append(workspaceNotifications.addObserver(
+                forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.store.setTemporaryKeyboardPrivacyEnabled(false)
+                })
+        }
+
         // If this instance was just installed by a self-update, show the
         // confirmation and open the panel automatically.
         if let updatedTo = UserDefaults.standard.string(forKey: "didSelfUpdateTo") {
@@ -1251,8 +1503,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        store.setTemporaryKeyboardPrivacyEnabled(false)
+        store.stopKeyboardPrivacyMonitoring()
+        for observer in privacyCleanupObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
         store.shortcuts.stop()
         store.mouseButtons.stop()
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        store.startKeyboardPrivacyMonitoring()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        store.stopKeyboardPrivacyMonitoring()
     }
 
     /// Show the popover (used by the post-update confirmation).
