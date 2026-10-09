@@ -157,6 +157,7 @@ final class MouseButtonsStore: ObservableObject {
     @Published private(set) var rules: [MouseButtonRule] = []
     @Published private(set) var paused: Bool
     @Published private(set) var capturing = false
+    @Published private(set) var captureNeedsRetry = false
     @Published private(set) var capturedButton: Int?
     @Published private(set) var accessibilityGranted = false
     @Published private(set) var monitoring = false
@@ -173,7 +174,6 @@ final class MouseButtonsStore: ObservableObject {
     private var outputRecordingDepth = 0
     private var keyboardRecording = false
     private var captureTimeout: DispatchWorkItem?
-    private var captureNeedsRetry = false
     private var accessTimer: Timer?
     private var generation = UUID()
     private let rulesKey = "mouseButtonRules.v1"
@@ -204,6 +204,7 @@ final class MouseButtonsStore: ObservableObject {
             self.runner.cancel()
             self.router.reset()
             self.generation = UUID()
+            if self.capturing { self.captureNeedsRetry = true }
             self.capturing = false
             self.captureTimeout?.cancel()
         }
@@ -213,6 +214,11 @@ final class MouseButtonsStore: ObservableObject {
         guard started, !paused, outputRecordingDepth == 0, !keyboardRecording, !capturing,
               monitoring, monitorError == nil else { return 0 }
         return rules.filter { $0.assignment.enabled && ruleErrors[$0.id] == nil }.count
+    }
+
+    var recoveryMessage: String? {
+        monitorError ?? (captureNeedsRetry
+            ? "Mouse button recording stopped. Choose Retry to record it again." : nil)
     }
 
     func start() { started = true; configure() }
@@ -321,11 +327,11 @@ final class MouseButtonsStore: ObservableObject {
         guard monitoring else {
             let issue = monitorError
             capturing = false
+            captureNeedsRetry = true
             configure()
             if monitoring {
                 actionError = "Mouse button recording failed. \(issue ?? "Try recording again.")"
             } else {
-                captureNeedsRetry = true
                 monitorError = issue
             }
             return
@@ -453,7 +459,7 @@ struct MouseButtonsButton: View {
                     Spacer()
                     Image(systemName: "chevron.right").font(.caption)
                 }
-                if buttons.monitorError != nil || buttons.actionError != nil || !buttons.ruleErrors.isEmpty {
+                if buttons.recoveryMessage != nil || buttons.actionError != nil || !buttons.ruleErrors.isEmpty {
                     Label("A mouse assignment needs attention", systemImage: "exclamationmark.circle")
                         .font(.caption).foregroundStyle(.orange)
                 }
@@ -496,7 +502,8 @@ final class MouseButtonsWindow: NSWindowController, NSWindowDelegate {
     }
     func windowDidResignKey(_ notification: Notification) {
         window?.makeFirstResponder(nil)
-        buttons.cancelCapture()
+        // Settings may take focus while a failed capture awaits permission.
+        if buttons.capturing { buttons.cancelCapture() }
     }
 }
 
@@ -523,11 +530,11 @@ private struct MouseButtonsView: View {
                     .toggleStyle(.switch).fixedSize()
             }.padding(20)
             Divider()
-            if !store.accessibilityGranted || store.monitorError != nil {
+            if !store.accessibilityGranted || store.recoveryMessage != nil {
                 HStack(alignment: .top, spacing: 12) {
                     Image(systemName: "hand.raised")
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(store.monitorError ?? "Allow Accessibility to record and customise mouse buttons.")
+                        Text(store.recoveryMessage ?? "Allow Accessibility to record and customise mouse buttons.")
                             .fixedSize(horizontal: false, vertical: true)
                         HStack {
                             Button("Allow Accessibility…") { store.requestAccessibility() }

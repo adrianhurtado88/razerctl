@@ -389,3 +389,139 @@ coordinatedKeyboard.stop()
 coordinatedMouse.stop()
 
 print("Passed: shared keyboard/mouse recording, nested and mixed recorder lifetimes, click release draining, queued-action cancellation and stop/restart. No input intercepted or actions posted.")
+
+let interruptedSuite = mouseSuite + ".interrupted"
+let interruptedDefaults = UserDefaults(suiteName: interruptedSuite)!
+defer { interruptedDefaults.removePersistentDomain(forName: interruptedSuite) }
+let interruptedMonitor = FakeMouseMonitor()
+let interruptedRunner = FakeShortcutRunner()
+interruptedRunner.accessibilityGranted = true
+let interruptedStore = MouseButtonsStore(defaults: interruptedDefaults,
+    monitor: interruptedMonitor, runner: interruptedRunner)
+interruptedStore.start()
+interruptedStore.beginCapture()
+DispatchQueue.main.async { interruptedMonitor.onIssue?("Capture listener stopped.") }
+settleMouseActions()
+check(!interruptedStore.capturing && interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage != nil,
+      "An asynchronous first-recording failure must preserve a visible Retry")
+// Exercise the production window callbacks without showing the window.
+let interruptedWindow = MouseButtonsWindow(store: interruptedStore)
+let interruptedFocusLoss = Notification(name: NSWindow.didResignKeyNotification,
+    object: interruptedWindow.window)
+let interruptedFocusGain = Notification(name: NSWindow.didBecomeKeyNotification,
+    object: interruptedWindow.window)
+interruptedWindow.windowDidResignKey(interruptedFocusLoss)
+check(!interruptedStore.capturing && interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage != nil,
+      "Opening permission settings must preserve an interrupted capture's Retry")
+
+interruptedRunner.accessibilityGranted = false
+interruptedStore.refreshAccess()
+interruptedWindow.windowDidResignKey(interruptedFocusLoss)
+let startsBeforeDeniedRetry = interruptedMonitor.starts
+interruptedStore.retry()
+check(interruptedMonitor.starts == startsBeforeDeniedRetry && interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage != nil,
+      "A denied Retry must retain the pending capture without starting a listener")
+interruptedRunner.accessibilityGranted = true
+interruptedWindow.windowDidBecomeKey(interruptedFocusGain)
+interruptedStore.setKeyboardRecording(true)
+interruptedStore.setKeyboardRecording(false)
+check(!interruptedStore.monitoring && interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage != nil,
+      "Permission refresh and reconfiguration must keep the failed capture Retry visible")
+
+interruptedMonitor.failStart = true
+for _ in 0..<2 {
+    let startsBeforeInterruptedRetry = interruptedMonitor.starts
+    interruptedStore.retry()
+    check(interruptedMonitor.starts > startsBeforeInterruptedRetry
+          && !interruptedStore.capturing && interruptedStore.captureNeedsRetry
+          && interruptedStore.recoveryMessage != nil,
+          "Repeated failed retries must attempt capture and retain its recovery state")
+}
+interruptedMonitor.failStart = false
+let startsBeforeRecoveredCapture = interruptedMonitor.starts
+interruptedStore.retry()
+check(interruptedMonitor.starts > startsBeforeRecoveredCapture
+      && interruptedStore.capturing && interruptedStore.monitoring
+      && !interruptedStore.captureNeedsRetry && interruptedStore.recoveryMessage == nil,
+      "Retry must resume an interrupted first capture when the listener recovers")
+check(interruptedMonitor.input(7, .down))
+settleMouseActions()
+check(interruptedStore.capturedButton == 7 && !interruptedStore.capturing)
+check(interruptedMonitor.input(7, .up))
+settleMouseActions()
+check(interruptedRunner.performed.isEmpty)
+
+interruptedStore.beginCapture()
+check(interruptedStore.capturing && interruptedStore.monitoring)
+interruptedWindow.windowDidResignKey(interruptedFocusLoss)
+check(!interruptedStore.capturing && !interruptedStore.captureNeedsRetry
+      && !interruptedStore.monitoring && interruptedStore.recoveryMessage == nil,
+      "Leaving the editor during a live capture must still cancel it")
+
+interruptedStore.beginCapture()
+DispatchQueue.main.async { interruptedMonitor.onIssue?("Capture listener stopped again.") }
+settleMouseActions()
+interruptedStore.cancelCapture()
+let startsBeforeCancelledRetry = interruptedMonitor.starts
+interruptedStore.retry()
+check(!interruptedStore.captureNeedsRetry && interruptedStore.recoveryMessage == nil
+      && !interruptedStore.capturing && interruptedMonitor.starts == startsBeforeCancelledRetry,
+      "Explicit cancellation must clear the pending capture and its Retry message")
+
+interruptedStore.beginCapture()
+DispatchQueue.main.async { interruptedMonitor.onIssue?("Capture stopped before closing.") }
+settleMouseActions()
+check(interruptedStore.captureNeedsRetry)
+interruptedWindow.windowWillClose(Notification(name: NSWindow.willCloseNotification,
+    object: interruptedWindow.window))
+let startsBeforeClosedRetry = interruptedMonitor.starts
+interruptedStore.retry()
+check(!interruptedStore.captureNeedsRetry && interruptedStore.recoveryMessage == nil
+      && !interruptedStore.capturing && interruptedMonitor.starts == startsBeforeClosedRetry,
+      "Closing the editor must discard pending capture recovery")
+
+try interruptedStore.save(mouseRule)
+DispatchQueue.main.async { interruptedMonitor.onIssue?("Assignment listener stopped.") }
+settleMouseActions()
+check(!interruptedStore.captureNeedsRetry && interruptedStore.recoveryMessage != nil)
+interruptedStore.retry()
+check(interruptedStore.monitoring && !interruptedStore.capturing
+      && !interruptedStore.captureNeedsRetry,
+      "Retrying an ordinary assignment-listener failure must not begin recording")
+check(interruptedMonitor.input(3, .down) && interruptedMonitor.input(3, .up))
+settleMouseActions()
+check(interruptedRunner.performed == [mouseRule.assignment])
+
+interruptedStore.beginCapture()
+DispatchQueue.main.async { interruptedMonitor.onIssue?("Capture lost access.") }
+settleMouseActions()
+interruptedRunner.accessibilityGranted = false
+interruptedStore.refreshAccess()
+interruptedRunner.accessibilityGranted = true
+interruptedStore.refreshAccess()
+check(interruptedStore.monitoring && interruptedStore.activeCount == 1
+      && interruptedStore.monitorError == nil && interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage != nil,
+      "Restoring saved assignments must leave the interrupted capture Retry visible")
+interruptedWindow.windowDidResignKey(interruptedFocusLoss)
+check(interruptedStore.monitoring && interruptedStore.activeCount == 1
+      && interruptedStore.captureNeedsRetry && interruptedStore.recoveryMessage != nil,
+      "Settings focus changes must retain capture recovery alongside healthy assignments")
+// A failed capture start may restore saved assignments on its second attempt.
+interruptedMonitor.failNextStart = true
+interruptedStore.retry()
+check(interruptedStore.monitoring && interruptedStore.activeCount == 1
+      && !interruptedStore.capturing && interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage != nil,
+      "Restoring assignments after a failed Retry must not discard the capture request")
+interruptedStore.retry()
+check(interruptedStore.capturing && !interruptedStore.captureNeedsRetry
+      && interruptedStore.recoveryMessage == nil)
+interruptedStore.cancelCapture()
+interruptedStore.stop()
+
+print("Passed: asynchronous capture recovery, focus changes, repeated Retry failures, permission refresh, restored assignments, active-capture cancellation and editor closing. No window shown, mouse events intercepted or actions posted.")
