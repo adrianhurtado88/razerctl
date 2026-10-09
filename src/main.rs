@@ -230,6 +230,52 @@ fn validate_command(p: &devices::Profile, cmd: &str, args: &[&str]) -> Result<()
     Ok(())
 }
 
+fn format_dpi_stage_info(resp: &Report) -> String {
+    let count = resp.arg(2).min(5);
+    let stages: Vec<String> = (0..count)
+        .map(|i| {
+            let base = 3 + (i as usize) * 7;
+            let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
+            let y = ((resp.arg(base + 3) as u16) << 8) | resp.arg(base + 4) as u16;
+            if x == y {
+                format!("{x}")
+            } else {
+                format!("{x}x{y}")
+            }
+        })
+        .collect();
+    format!(
+        "  stages:    [{}] (active: {})\n",
+        stages.join(", "),
+        resp.arg(1)
+    )
+}
+
+fn format_dpi_stage_status(resp: &Report, dpi_max: u16) -> Option<String> {
+    let count = resp.arg(2).min(5);
+    let stages: Vec<String> = (0..count)
+        .map(|i| {
+            let base = 3 + (i as usize) * 7;
+            let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
+            x.to_string()
+        })
+        .collect();
+    if (1..=5).contains(&resp.arg(2))
+        && (1..=resp.arg(2)).contains(&resp.arg(1))
+        && stages
+            .iter()
+            .all(|s| s.parse::<u16>().is_ok_and(|dpi| dpi > 0 && dpi <= dpi_max))
+    {
+        Some(format!(
+            "stages={}\nactive_stage={}\n",
+            stages.join(","),
+            resp.arg(1)
+        ))
+    } else {
+        None
+    }
+}
+
 fn cmd_info(handles: &[Handle]) -> Result<String, String> {
     if handles.is_empty() {
         return Err("no supported Razer devices are connected".into());
@@ -248,25 +294,7 @@ fn cmd_info(handles: &[Handle]) -> Result<String, String> {
                 out.push_str(&format!("  dpi:       {x} x {y}\n"));
             }
             if let Ok(resp) = h.execute(get_dpi_stages(p.txid)) {
-                let active = resp.arg(1);
-                let count = resp.arg(2).min(5);
-                let stages: Vec<String> = (0..count)
-                    .filter_map(|i| {
-                        let base = 3 + (i as usize) * 7;
-                        let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
-                        let y = ((resp.arg(base + 3) as u16) << 8) | resp.arg(base + 4) as u16;
-                        Some(if x == y {
-                            format!("{x}")
-                        } else {
-                            format!("{x}x{y}")
-                        })
-                    })
-                    .collect();
-                out.push_str(&format!(
-                    "  stages:    [{}] (active: {})\n",
-                    stages.join(", "),
-                    active + 1
-                ));
+                out.push_str(&format_dpi_stage_info(&resp));
             }
             if let Ok(resp) = h.execute(get_poll_rate(p.txid)) {
                 let rate = match resp.arg(0) {
@@ -363,26 +391,8 @@ fn cmd_status(handles: &[Handle], failures: &[String]) -> Result<String, String>
                     }
                 }
                 if let Ok(resp) = h.execute(get_dpi_stages(p.txid)) {
-                    let active = resp.arg(1);
-                    let count = resp.arg(2).min(5);
-                    let stages: Vec<String> = (0..count)
-                        .filter_map(|i| {
-                            let base = 3 + (i as usize) * 7;
-                            let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
-                            Some(x.to_string())
-                        })
-                        .collect();
-                    if (1..=5).contains(&resp.arg(2))
-                        && stages.iter().all(|s| {
-                            s.parse::<u16>()
-                                .is_ok_and(|dpi| dpi > 0 && dpi <= p.dpi_max)
-                        })
-                    {
-                        out.push_str(&format!(
-                            "stages={}\nactive_stage={}\n",
-                            stages.join(","),
-                            active + 1
-                        ));
+                    if let Some(status) = format_dpi_stage_status(&resp, p.dpi_max) {
+                        out.push_str(&status);
                     }
                 }
                 if let Ok(resp) = h.execute(get_poll_rate(p.txid)) {
@@ -456,47 +466,63 @@ fn cmd_dpi(handles: &[Handle], args: &[&str]) -> Result<String, String> {
     Ok(out.trim_end().to_string())
 }
 
-fn cmd_stages(handles: &[Handle], args: &[&str]) -> Result<String, String> {
-    let raw = args
-        .first()
-        .ok_or("usage: razerctl stages <v1,v2,...> [active]")?;
-    let stages: Vec<u16> = raw
-        .split(',')
-        .map(|s| s.trim().parse::<u16>())
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("'{raw}' is not a comma-separated list of numbers"))?;
-    if !(2..=5).contains(&stages.len()) {
-        return Err("provide between 2 and 5 DPI stages".into());
-    }
-    let active: u8 = match args.get(1) {
-        Some(v) => {
-            let n = v
-                .parse::<u8>()
-                .map_err(|_| "active stage must be a number".to_string())?;
-            // Stages are 1-based on the wire; guard the 0 case instead of
-            // underflowing (which panics in debug builds).
-            n.checked_sub(1)
-                .ok_or("active stage must be 1 or greater")?
+struct DpiStages {
+    values: Vec<u16>,
+    active: u8,
+}
+
+impl DpiStages {
+    fn parse(args: &[&str]) -> Result<Self, String> {
+        let raw = args
+            .first()
+            .ok_or("usage: razerctl stages <v1,v2,...> [active]")?;
+        let values: Vec<u16> = raw
+            .split(',')
+            .map(|s| s.trim().parse::<u16>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| format!("'{raw}' is not a comma-separated list of numbers"))?;
+        if !(2..=5).contains(&values.len()) {
+            return Err("provide between 2 and 5 DPI stages".into());
         }
-        None => 0,
-    };
-    if active as usize >= stages.len() {
-        return Err(format!("active stage {} is out of range", active + 1));
+
+        // The active byte is one-based; stage record IDs are zero-based.
+        let active = match args.get(1) {
+            Some(v) => v
+                .parse::<u8>()
+                .map_err(|_| "active stage must be a number".to_string())?,
+            None => 1,
+        };
+        if active == 0 {
+            return Err("active stage must be 1 or greater".into());
+        }
+        if active as usize > values.len() {
+            return Err(format!("active stage {active} is out of range"));
+        }
+        Ok(Self { values, active })
     }
+
+    fn report(&self, txid: u8) -> Report {
+        set_dpi_stages(txid, self.active, &self.values)
+    }
+}
+
+fn cmd_stages(handles: &[Handle], args: &[&str]) -> Result<String, String> {
+    let stages = DpiStages::parse(args)?;
     let mut out = String::new();
     for h in handles.iter().filter(|h| h.profile().is_mouse()) {
         let p = h.profile();
-        h.execute(set_dpi_stages(p.txid, active, &stages))
+        h.execute(stages.report(p.txid))
             .map_err(|e| format!("{}: {e}", p.name))?;
         out.push_str(&format!(
             "✓ {}: DPI stages → [{}] (active: {})\n",
             p.name,
             stages
+                .values
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            active + 1
+            stages.active
         ));
     }
     if out.is_empty() {
@@ -766,5 +792,94 @@ mod tests {
         assert_eq!(decode_poll_rate(8), Some(125));
         assert_eq!(decode_poll_rate(0), None);
         assert_eq!(decode_poll_rate(3), None);
+    }
+
+    #[test]
+    fn dpi_stage_commands_serialize_one_based_active_and_zero_based_records() {
+        let default = DpiStages::parse(&["400,800"]).unwrap();
+        assert_eq!(default.report(0x1F).arg(1), 1);
+
+        for active in ["1", "2", "5"] {
+            let stages = DpiStages::parse(&["400,800,1600,3200,6400", active]).unwrap();
+            let report = stages.report(0x1F).finalize();
+            assert_eq!(report.bytes[1], 0x1F);
+            assert_eq!(&report.bytes[5..8], &[0x26, 0x04, 0x06]);
+            assert_eq!(report.arg(0), VARSTORE);
+            assert_eq!(report.arg(1), active.parse::<u8>().unwrap());
+            assert_eq!(report.arg(2), 5);
+            for (i, dpi) in [400u16, 800, 1600, 3200, 6400].iter().enumerate() {
+                let base = 3 + i * 7;
+                assert_eq!(report.arg(base), i as u8);
+                assert_eq!(
+                    &report.bytes[8 + base + 1..8 + base + 7],
+                    &[
+                        (dpi >> 8) as u8,
+                        *dpi as u8,
+                        (dpi >> 8) as u8,
+                        *dpi as u8,
+                        0,
+                        0
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dpi_stage_commands_reject_invalid_active_and_stage_counts() {
+        for active in ["0", "3", "255", "256", "-1", "second"] {
+            assert!(DpiStages::parse(&["400,800", active]).is_err());
+        }
+        assert!(DpiStages::parse(&[]).is_err());
+        assert!(DpiStages::parse(&["400"]).is_err());
+        assert!(DpiStages::parse(&["400,800,1600,3200,6400,12800"]).is_err());
+    }
+
+    fn stage_response(active: u8) -> Report {
+        let mut report = Report::new(0x1F, 0x04, 0x86, 0x26);
+        report.bytes[0] = STATUS_SUCCESSFUL;
+        report.set_arg(0, VARSTORE).set_arg(1, active).set_arg(2, 5);
+        for (i, (x, y)) in [
+            (400u16, 800u16),
+            (800, 800),
+            (1600, 1600),
+            (3200, 3200),
+            (6400, 6400),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let base = 3 + i * 7;
+            report
+                .set_arg(base, i as u8)
+                .set_arg(base + 1, (x >> 8) as u8)
+                .set_arg(base + 2, *x as u8)
+                .set_arg(base + 3, (y >> 8) as u8)
+                .set_arg(base + 4, *y as u8);
+        }
+        report
+    }
+
+    #[test]
+    fn dpi_stage_readbacks_preserve_one_based_active_in_info_and_status() {
+        for active in [1, 2, 5] {
+            let response = stage_response(active);
+            assert_eq!(
+                format_dpi_stage_info(&response),
+                format!("  stages:    [400x800, 800, 1600, 3200, 6400] (active: {active})\n")
+            );
+            assert_eq!(
+                format_dpi_stage_status(&response, 26000),
+                Some(format!(
+                    "stages=400,800,1600,3200,6400\nactive_stage={active}\n"
+                ))
+            );
+        }
+        for active in [0, 6, 255] {
+            assert!(format_dpi_stage_status(&stage_response(active), 26000).is_none());
+        }
+        let mut invalid_count = stage_response(1);
+        invalid_count.set_arg(2, 6);
+        assert!(format_dpi_stage_status(&invalid_count, 26000).is_none());
     }
 }
