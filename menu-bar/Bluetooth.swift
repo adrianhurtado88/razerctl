@@ -241,6 +241,7 @@ final class BluetoothController: NSObject, BluetoothBackend, CBCentralManagerDel
             }
             do {
                 let table = try readStages(id: peripheral.identifier, profile: profile)
+                capabilities.dpi_min = 100
                 capabilities.dpi_max = profile.dpiMax
                 capabilities.dpi_stages = true
                 let x = table.x(table.activeIndex), y = table.y(table.activeIndex)
