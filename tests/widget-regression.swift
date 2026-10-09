@@ -116,6 +116,32 @@ detectedMouseStore.applyEffect("rainbow", device: "mouse")
 settle(detectedMouseStore)
 check(commands().last == "rainbow 11 --id mouse-1")
 
+// A later effect selection must replace pending static-color writes.
+let beforeRapidEffectSwitch = commands().count
+actionStore.kbdEffect = "static"
+actionStore.applyEffect("static", device: "keyboard")
+actionStore.kbdEffect = "spectrum"
+actionStore.applyEffect("spectrum", device: "keyboard")
+settle(discoveryStore)
+check(Array(commands().dropFirst(beforeRapidEffectSwitch)) == ["effect spectrum --dev keyboard --id kbd-1"],
+      "Static then Spectrum within the debounce must send only Spectrum")
+check(actionStore.kbdEffect == "spectrum", "A stale color callback must not restore Static")
+
+let beforeColorToOff = commands().count
+actionStore.kbdEffect = "static"
+actionStore.applyStatic(color: .red, device: "keyboard")
+detectedMouseStore.applyStatic(color: .red, device: "mouse")
+detectedMouseStore.applyStatic(color: .green, device: "mouse")
+detectedMouseStore.applyStatic(color: Color(red: 0, green: 0, blue: 1), device: "mouse")
+actionStore.kbdEffect = "none"
+actionStore.applyEffect("none", device: "keyboard")
+settle(discoveryStore)
+check(Array(commands().dropFirst(beforeColorToOff)) == [
+    "effect none --dev keyboard --id kbd-1", "effect static 0000FF --dev mouse --id mouse-1"
+], "Turning off one device must cancel its color while preserving another device's final drag color")
+check(actionStore.kbdEffect == "none" && detectedMouseStore.mouseEffect == "static",
+      "Independent device selections must retain their latest effects")
+
 // A stable inventory does not cause repeated control reads.
 let commandsFile = testDirectory.appendingPathComponent("commands.txt")
 let beforeStableCheck = try String(contentsOf: commandsFile, encoding: .utf8).split(separator: "\n").filter { $0 == "detect" }.count

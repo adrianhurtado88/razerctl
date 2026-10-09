@@ -641,6 +641,8 @@ final class Store: ObservableObject, Identifiable {
     // MARK: Device actions
 
     func applyEffect(_ name: String, device: String) {
+        // A newer effect replaces any pending static-color write.
+        colorDebounces.removeValue(forKey: device)?.cancel()
         if name == "static" {
             applyStatic(color: device == "keyboard" ? kbdColor : mouseColor, device: device)
         } else if name == "rainbow" {
