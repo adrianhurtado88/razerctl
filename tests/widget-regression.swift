@@ -107,6 +107,9 @@ final class SecureInputFixture {
     var disableCalls = 0
     var enableResult: OSStatus = noErr
     var disableResult: OSStatus = noErr
+    var activity: NSObjectProtocol?
+    var activityBegins = 0
+    var activityEnds = 0
     func status() -> Bool { otherAppActive || requests > 0 }
     func enable() -> OSStatus {
         check(Thread.isMainThread)
@@ -118,12 +121,31 @@ final class SecureInputFixture {
         check(Thread.isMainThread)
         disableCalls += 1
         check(requests == 1, "Release must balance our single request, not another app's")
+        check(activity != nil, "The shutoff must stay protected from App Nap until secure input is released")
         if disableResult == noErr { requests -= 1 }
         return disableResult
     }
+    func beginActivity(_ options: ProcessInfo.ActivityOptions) -> NSObjectProtocol {
+        check(Thread.isMainThread)
+        check(requests == 1 && activity == nil, "Only an owned secure-input request needs an activity")
+        check(options == .userInitiatedAllowingIdleSystemSleep,
+              "Temporary privacy must prevent App Nap while still allowing system sleep")
+        activityBegins += 1
+        let token = NSObject()
+        activity = token
+        return token
+    }
+    func endActivity(_ token: NSObjectProtocol) {
+        check(Thread.isMainThread)
+        check(requests == 0, "Keep App Nap protection during a failed release so the timer can retry")
+        check(activity === token, "End exactly the activity owned by this session")
+        activityEnds += 1
+        activity = nil
+    }
     func makeStore() -> Store {
         Store(secureInputStatus: status, enableSecureInput: enable,
-              disableSecureInput: disable, privacyUptime: { self.uptime })
+              disableSecureInput: disable, privacyUptime: { self.uptime },
+              beginPrivacyActivity: beginActivity, endPrivacyActivity: endActivity)
     }
 }
 let temporaryInput = SecureInputFixture()
@@ -132,10 +154,13 @@ let temporaryStore = temporaryInput.makeStore()
 temporaryStore.startKeyboardPrivacyMonitoring()
 temporaryStore.setTemporaryKeyboardPrivacyEnabled(false)
 check(temporaryInput.disableCalls == 0, "An active status from another app must not grant ownership")
+check(temporaryInput.activityBegins == 0, "Monitoring another app's status must not prevent App Nap")
 temporaryStore.setTemporaryKeyboardPrivacyEnabled(true)
 temporaryStore.setTemporaryKeyboardPrivacyEnabled(true)
 check(temporaryInput.enableCalls == 1 && temporaryInput.requests == 1,
       "Repeated On actions must not acquire extra requests")
+check(temporaryInput.activityBegins == 1 && temporaryInput.activityEnds == 0,
+      "Repeated On actions must hold exactly one App Nap activity")
 check(temporaryStore.temporaryKeyboardPrivacySecondsRemaining == 600)
 temporaryInput.uptime += 61
 temporaryStore.startKeyboardPrivacyMonitoring()
@@ -143,11 +168,15 @@ check(temporaryStore.temporaryKeyboardPrivacySecondsRemaining == 539,
       "Opening the panel must not extend the session")
 temporaryStore.stopKeyboardPrivacyMonitoring()
 check(temporaryStore.temporaryKeyboardPrivacyEnabled, "Closing the panel must leave the temporary mode running")
+check(temporaryInput.activity != nil && temporaryInput.activityEnds == 0,
+      "Closing the panel must retain App Nap protection for the shutoff")
 temporaryInput.uptime += 539
 RunLoop.main.run(until: Date().addingTimeInterval(1.4))
 check(!temporaryStore.temporaryKeyboardPrivacyEnabled && temporaryInput.requests == 0,
       "Automatic shutoff must work while the panel is closed")
 check(temporaryInput.disableCalls == 1)
+check(temporaryInput.activity == nil && temporaryInput.activityEnds == 1,
+      "Automatic shutoff must release its App Nap activity")
 temporaryStore.startKeyboardPrivacyMonitoring()
 check(temporaryStore.secureKeyboardEntryEnabled == true,
       "Releasing our request must leave another app's secure-input status intact")
@@ -159,6 +188,8 @@ temporaryStore.setTemporaryKeyboardPrivacyEnabled(false)
 temporaryStore.setTemporaryKeyboardPrivacyEnabled(false)
 check(temporaryInput.enableCalls == 2 && temporaryInput.disableCalls == 2,
       "Manual Off and repeated cleanup must balance exactly one request")
+check(temporaryInput.activityBegins == 2 && temporaryInput.activityEnds == 2,
+      "Manual Off and repeated cleanup must balance the activity across sessions")
 temporaryStore.stopKeyboardPrivacyMonitoring()
 
 let failingInput = SecureInputFixture()
@@ -168,6 +199,7 @@ failingPrivacyStore.startKeyboardPrivacyMonitoring()
 failingPrivacyStore.setTemporaryKeyboardPrivacyEnabled(true)
 check(!failingPrivacyStore.temporaryKeyboardPrivacyEnabled && failingPrivacyStore.keyboardPrivacyError != nil,
       "A failed enable must not show the switch as on")
+check(failingInput.activityBegins == 0, "A failed enable must not create an App Nap activity")
 failingPrivacyStore.setTemporaryKeyboardPrivacyEnabled(false)
 check(failingInput.disableCalls == 0, "A failed enable must not create a request to release")
 failingInput.enableResult = noErr
@@ -176,6 +208,8 @@ failingInput.disableResult = -1
 failingPrivacyStore.setTemporaryKeyboardPrivacyEnabled(false)
 check(failingPrivacyStore.temporaryKeyboardPrivacyEnabled && failingPrivacyStore.keyboardPrivacyError != nil,
       "A failed disable must keep the switch on and expose a recovery action")
+check(failingInput.activity != nil && failingInput.activityEnds == 0,
+      "A failed disable must retain App Nap protection for release retries")
 failingInput.uptime += 600
 failingPrivacyStore.startKeyboardPrivacyMonitoring()
 check(failingPrivacyStore.temporaryKeyboardPrivacyEnabled && failingPrivacyStore.temporaryKeyboardPrivacySecondsRemaining == 0)
@@ -183,6 +217,8 @@ failingInput.disableResult = noErr
 RunLoop.main.run(until: Date().addingTimeInterval(1.4))
 check(!failingPrivacyStore.temporaryKeyboardPrivacyEnabled && failingInput.requests == 0,
       "An expired session should retry a failed release")
+check(failingInput.activity == nil && failingInput.activityEnds == 1,
+      "A successful release retry must end the activity")
 check(failingPrivacyStore.keyboardPrivacyError == nil)
 failingPrivacyStore.stopKeyboardPrivacyMonitoring()
 
@@ -192,6 +228,8 @@ cleanupStore?.setTemporaryKeyboardPrivacyEnabled(true)
 cleanupStore = nil
 check(cleanupInput.requests == 0 && cleanupInput.disableCalls == 1,
       "Destroying the owner must release its outstanding request")
+check(cleanupInput.activity == nil && cleanupInput.activityEnds == 1,
+      "Destroying the owner must release its App Nap activity")
 check(commands() == commandsBeforePrivacy, "Temporary privacy must not send device commands")
 
 func descendant<T: NSView>(_ type: T.Type, in view: NSView) -> T? {

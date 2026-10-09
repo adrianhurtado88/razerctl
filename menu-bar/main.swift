@@ -27,6 +27,9 @@ final class Store: ObservableObject {
     private let enableSecureInput: () -> OSStatus
     private let disableSecureInput: () -> OSStatus
     private let privacyUptime: () -> TimeInterval
+    private let beginPrivacyActivity: (ProcessInfo.ActivityOptions) -> NSObjectProtocol
+    private let endPrivacyActivity: (NSObjectProtocol) -> Void
+    private var keyboardPrivacyActivity: NSObjectProtocol?
     private var keyboardPrivacyTimer: Timer?
     private var keyboardPrivacyPanelVisible = false
     private var keyboardPrivacyDeadline: TimeInterval?
@@ -37,8 +40,14 @@ final class Store: ObservableObject {
             // Release exactly the request owned by this Store. Carbon's
             // secure-input APIs must be called on the main thread.
             let release = disableSecureInput
-            if Thread.isMainThread { _ = release() }
-            else { DispatchQueue.main.async { _ = release() } }
+            let activity = keyboardPrivacyActivity
+            let endActivity = endPrivacyActivity
+            let cleanup = {
+                _ = release()
+                if let activity { endActivity(activity) }
+            }
+            if Thread.isMainThread { cleanup() }
+            else { DispatchQueue.main.async(execute: cleanup) }
         }
     }
 
@@ -66,6 +75,9 @@ final class Store: ObservableObject {
                 refreshKeyboardPrivacy()
                 return
             }
+            // The shutoff must keep running after the panel closes. Prevent
+            // App Nap while we own secure input, without preventing Mac sleep.
+            keyboardPrivacyActivity = beginPrivacyActivity(.userInitiatedAllowingIdleSystemSleep)
             temporaryKeyboardPrivacyEnabled = true
             keyboardPrivacyDeadline = privacyUptime() + Self.keyboardPrivacyDuration
         } else {
@@ -79,6 +91,10 @@ final class Store: ObservableObject {
         guard disableSecureInput() == noErr else {
             keyboardPrivacyError = "Couldn't turn off temporary privacy. Try again or quit RazerCtl."
             return
+        }
+        if let activity = keyboardPrivacyActivity {
+            endPrivacyActivity(activity)
+            keyboardPrivacyActivity = nil
         }
         temporaryKeyboardPrivacyEnabled = false
         keyboardPrivacyDeadline = nil
@@ -127,11 +143,17 @@ final class Store: ObservableObject {
     init(secureInputStatus: @escaping () -> Bool = { IsSecureEventInputEnabled() },
          enableSecureInput: @escaping () -> OSStatus = { EnableSecureEventInput() },
          disableSecureInput: @escaping () -> OSStatus = { DisableSecureEventInput() },
-         privacyUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         privacyUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         beginPrivacyActivity: @escaping (ProcessInfo.ActivityOptions) -> NSObjectProtocol = {
+             ProcessInfo.processInfo.beginActivity(options: $0, reason: "Turn off temporary keyboard privacy on time")
+         },
+         endPrivacyActivity: @escaping (NSObjectProtocol) -> Void = { ProcessInfo.processInfo.endActivity($0) }) {
         self.secureInputStatus = secureInputStatus
         self.enableSecureInput = enableSecureInput
         self.disableSecureInput = disableSecureInput
         self.privacyUptime = privacyUptime
+        self.beginPrivacyActivity = beginPrivacyActivity
+        self.endPrivacyActivity = endPrivacyActivity
         let keyboard = shortcuts
         mouseButtons.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
     }
