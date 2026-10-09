@@ -22,5 +22,5 @@ Path(os.environ['WIDGET_TEST_DIR'], 'main.swift').write_text(
     + '\n' + Path('tests/bluetooth-regression.swift').read_text()
 )
 PY
-swiftc -O -o "$WIDGET_TEST_DIR/widget-check" "$WIDGET_TEST_DIR/main.swift" menu-bar/Bluetooth.swift
+swiftc -O -o "$WIDGET_TEST_DIR/widget-check" "$WIDGET_TEST_DIR/main.swift" menu-bar/Bluetooth.swift menu-bar/AppUpdate.swift
 "$WIDGET_TEST_DIR/widget-check"

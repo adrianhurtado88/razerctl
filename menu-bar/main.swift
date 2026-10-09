@@ -361,12 +361,9 @@ final class Store: ObservableObject, Identifiable {
                 guard FileManager.default.fileExists(atPath: newApp + "/Contents/MacOS/RazerCtl") else {
                     throw UpdateError.badArchive
                 }
-                // 3. Signature check: same code-signing team as us.
-                guard let newTeam = Self.teamIdentifier(of: newApp),
-                      let curTeam = Self.teamIdentifier(of: Bundle.main.bundlePath),
-                      newTeam == curTeam else {
-                    throw UpdateError.signatureMismatch
-                }
+                // 3. Verify integrity and the current app's signing identity.
+                try AppUpdate.verifySignature(at: URL(fileURLWithPath: newApp),
+                                              matching: Bundle.main.bundleURL)
                 // 4. Swap: current -> .old, new -> current. The running
                 //    process keeps its image; macOS allows this.
                 let bundle = Bundle.main.bundlePath
@@ -398,11 +395,10 @@ final class Store: ObservableObject, Identifiable {
     }
 
     enum UpdateError: LocalizedError {
-        case badArchive, signatureMismatch
+        case badArchive
         var errorDescription: String? {
             switch self {
             case .badArchive: return "the release zip has no RazerCtl.app"
-            case .signatureMismatch: return "downloaded app is signed by a different team"
             }
         }
     }
@@ -432,24 +428,6 @@ final class Store: ObservableObject, Identifiable {
             throw UpdateError.badArchive
         }
     }
-
-    /// The bundle's code-signing team identifier (e.g. "YC4FHM93C5").
-    private static func teamIdentifier(of bundlePath: String) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        p.arguments = ["-dv", "--verbose=4", bundlePath]
-        let err = Pipe()
-        p.standardError = err
-        p.standardOutput = Pipe()
-        do { try p.run() } catch { return nil }
-        p.waitUntilExit()
-        let out = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return out.split(separator: "\n")
-            .first { $0.hasPrefix("TeamIdentifier=") }?
-            .replacingOccurrences(of: "TeamIdentifier=", with: "")
-            .trimmingCharacters(in: .whitespaces)
-    }
-
 
     var coreURL: URL? {
         let dir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
