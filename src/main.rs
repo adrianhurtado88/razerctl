@@ -222,21 +222,37 @@ fn validate_command(p: &devices::Profile, cmd: &str, args: &[&str]) -> Result<()
             None
         }) {
             let dpi: u16 = value.trim().parse().map_err(|_| "DPI must be a number")?;
-            if dpi == 0 || dpi > p.dpi_max {
-                return Err(format!("{}: DPI must be 1-{}", p.name, p.dpi_max));
+            if !p.valid_dpi(dpi) {
+                return Err(format!(
+                    "{}: DPI must be {}-{}",
+                    p.name, p.dpi_min, p.dpi_max
+                ));
             }
         }
     }
     Ok(())
 }
 
-fn format_dpi_stage_info(resp: &Report) -> String {
-    let count = resp.arg(2).min(5);
-    let stages: Vec<String> = (0..count)
-        .map(|i| {
-            let base = 3 + (i as usize) * 7;
-            let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
-            let y = ((resp.arg(base + 3) as u16) << 8) | resp.arg(base + 4) as u16;
+fn decode_dpi_axes(resp: &Report, offset: usize, p: &devices::Profile) -> Option<(u16, u16)> {
+    let x = ((resp.arg(offset) as u16) << 8) | resp.arg(offset + 1) as u16;
+    let y = ((resp.arg(offset + 2) as u16) << 8) | resp.arg(offset + 3) as u16;
+    (p.valid_dpi(x) && p.valid_dpi(y)).then_some((x, y))
+}
+
+fn decode_dpi_stages(resp: &Report, p: &devices::Profile) -> Option<Vec<(u16, u16)>> {
+    let count = resp.arg(2);
+    if !(1..=5).contains(&count) || !(1..=count).contains(&resp.arg(1)) {
+        return None;
+    }
+    (0..count)
+        .map(|i| decode_dpi_axes(resp, 4 + i as usize * 7, p))
+        .collect()
+}
+
+fn format_dpi_stage_info(resp: &Report, p: &devices::Profile) -> Option<String> {
+    let stages: Vec<String> = decode_dpi_stages(resp, p)?
+        .into_iter()
+        .map(|(x, y)| {
             if x == y {
                 format!("{x}")
             } else {
@@ -244,36 +260,23 @@ fn format_dpi_stage_info(resp: &Report) -> String {
             }
         })
         .collect();
-    format!(
+    Some(format!(
         "  stages:    [{}] (active: {})\n",
         stages.join(", "),
         resp.arg(1)
-    )
+    ))
 }
 
-fn format_dpi_stage_status(resp: &Report, dpi_max: u16) -> Option<String> {
-    let count = resp.arg(2).min(5);
-    let stages: Vec<String> = (0..count)
-        .map(|i| {
-            let base = 3 + (i as usize) * 7;
-            let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
-            x.to_string()
-        })
+fn format_dpi_stage_status(resp: &Report, p: &devices::Profile) -> Option<String> {
+    let stages: Vec<String> = decode_dpi_stages(resp, p)?
+        .into_iter()
+        .map(|(x, _)| x.to_string())
         .collect();
-    if (1..=5).contains(&resp.arg(2))
-        && (1..=resp.arg(2)).contains(&resp.arg(1))
-        && stages
-            .iter()
-            .all(|s| s.parse::<u16>().is_ok_and(|dpi| dpi > 0 && dpi <= dpi_max))
-    {
-        Some(format!(
-            "stages={}\nactive_stage={}\n",
-            stages.join(","),
-            resp.arg(1)
-        ))
-    } else {
-        None
-    }
+    Some(format!(
+        "stages={}\nactive_stage={}\n",
+        stages.join(","),
+        resp.arg(1)
+    ))
 }
 
 fn cmd_info(handles: &[Handle]) -> Result<String, String> {
@@ -289,12 +292,14 @@ fn cmd_info(handles: &[Handle]) -> Result<String, String> {
         ));
         if p.is_mouse() {
             if let Ok(resp) = h.execute(get_dpi_xy(p.txid)) {
-                let x = ((resp.arg(1) as u16) << 8) | resp.arg(2) as u16;
-                let y = ((resp.arg(3) as u16) << 8) | resp.arg(4) as u16;
-                out.push_str(&format!("  dpi:       {x} x {y}\n"));
+                if let Some((x, y)) = decode_dpi_axes(&resp, 1, p) {
+                    out.push_str(&format!("  dpi:       {x} x {y}\n"));
+                }
             }
             if let Ok(resp) = h.execute(get_dpi_stages(p.txid)) {
-                out.push_str(&format_dpi_stage_info(&resp));
+                if let Some(info) = format_dpi_stage_info(&resp, p) {
+                    out.push_str(&info);
+                }
             }
             if let Ok(resp) = h.execute(get_poll_rate(p.txid)) {
                 let rate = match resp.arg(0) {
@@ -384,14 +389,12 @@ fn cmd_status(handles: &[Handle], failures: &[String]) -> Result<String, String>
                     p.name, h.firmware.0, h.firmware.1
                 ));
                 if let Ok(resp) = h.execute(get_dpi_xy(p.txid)) {
-                    let x = ((resp.arg(1) as u16) << 8) | resp.arg(2) as u16;
-                    let y = ((resp.arg(3) as u16) << 8) | resp.arg(4) as u16;
-                    if x > 0 && x <= p.dpi_max && y > 0 && y <= p.dpi_max {
+                    if let Some((x, y)) = decode_dpi_axes(&resp, 1, p) {
                         out.push_str(&format!("dpi={x}\ndpi_y={y}\n"));
                     }
                 }
                 if let Ok(resp) = h.execute(get_dpi_stages(p.txid)) {
-                    if let Some(status) = format_dpi_stage_status(&resp, p.dpi_max) {
+                    if let Some(status) = format_dpi_stage_status(&resp, p) {
                         out.push_str(&status);
                     }
                 }
@@ -439,21 +442,23 @@ fn cmd_dpi(handles: &[Handle], args: &[&str]) -> Result<String, String> {
     let x: u16 = args
         .first()
         .ok_or("usage: razerctl dpi <x> [<y>]")?
+        .trim()
         .parse()
         .map_err(|_| "DPI must be a number".to_string())?;
     let y: u16 = match args.get(1) {
-        Some(v) => v.parse().map_err(|_| "DPI must be a number".to_string())?,
+        Some(v) => v
+            .trim()
+            .parse()
+            .map_err(|_| "DPI must be a number".to_string())?,
         None => x,
     };
     let mut out = String::new();
     for h in handles.iter().filter(|h| h.profile().is_mouse()) {
         let p = h.profile();
-        if x > p.dpi_max || y > p.dpi_max {
+        if !p.valid_dpi(x) || !p.valid_dpi(y) {
             return Err(format!(
-                "DPI {} exceeds the {}'s maximum of {}",
-                x.max(y),
-                p.name,
-                p.dpi_max
+                "{}: DPI must be {}-{}",
+                p.name, p.dpi_min, p.dpi_max
             ));
         }
         h.execute(set_dpi_xy(p.txid, x, y))
@@ -783,6 +788,17 @@ mod tests {
         assert!(validate_command(profile(0x00A5), "stages", &["400,30001"]).is_err());
         assert!(validate_command(profile(0x00B6), "dpi", &["30000"]).is_ok());
         assert!(validate_command(profile(0x00B6), "dpi", &["35000"]).is_err());
+        for p in PROFILES.iter().filter(|p| p.is_mouse()) {
+            let max = p.dpi_max.to_string();
+            assert!(validate_command(p, "dpi", &[" \t100\n", &max]).is_ok());
+            assert!(validate_command(p, "stages", &[&format!(" 100, {max} ")]).is_ok());
+            for invalid in [0, 1, 99, p.dpi_max + 1] {
+                let value = invalid.to_string();
+                assert!(validate_command(p, "dpi", &[&value, "100"]).is_err());
+                assert!(validate_command(p, "dpi", &["100", &value]).is_err());
+                assert!(validate_command(p, "stages", &[&format!("100,{value}")]).is_err());
+            }
+        }
     }
 
     #[test]
@@ -860,26 +876,66 @@ mod tests {
         report
     }
 
+    fn set_axes(report: &mut Report, offset: usize, x: u16, y: u16) {
+        report
+            .set_arg(offset, (x >> 8) as u8)
+            .set_arg(offset + 1, x as u8)
+            .set_arg(offset + 2, (y >> 8) as u8)
+            .set_arg(offset + 3, y as u8);
+    }
+
+    #[test]
+    fn dpi_readbacks_validate_model_bounds_on_both_axes_and_every_stage() {
+        for p in PROFILES.iter().filter(|p| p.is_mouse()) {
+            let mut current = Report::new(p.txid, 0x04, 0x85, 0x07);
+            for (x, y) in [(100, p.dpi_max), (p.dpi_max, 100)] {
+                set_axes(&mut current, 1, x, y);
+                assert_eq!(decode_dpi_axes(&current, 1, p), Some((x, y)));
+                let mut stages = stage_response(1);
+                set_axes(&mut stages, 4, x, y);
+                assert!(format_dpi_stage_info(&stages, p).is_some());
+                assert!(format_dpi_stage_status(&stages, p).is_some());
+            }
+            for invalid in [0, 1, 99, p.dpi_max + 1] {
+                for (x, y) in [(invalid, 100), (100, invalid)] {
+                    set_axes(&mut current, 1, x, y);
+                    assert_eq!(decode_dpi_axes(&current, 1, p), None);
+                    for index in 0..5 {
+                        let mut stages = stage_response(1);
+                        set_axes(&mut stages, 4 + index * 7, x, y);
+                        assert!(format_dpi_stage_info(&stages, p).is_none());
+                        assert!(format_dpi_stage_status(&stages, p).is_none());
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn dpi_stage_readbacks_preserve_one_based_active_in_info_and_status() {
+        let p = profile(0x0099);
         for active in [1, 2, 5] {
             let response = stage_response(active);
             assert_eq!(
-                format_dpi_stage_info(&response),
-                format!("  stages:    [400x800, 800, 1600, 3200, 6400] (active: {active})\n")
+                format_dpi_stage_info(&response, p),
+                Some(format!(
+                    "  stages:    [400x800, 800, 1600, 3200, 6400] (active: {active})\n"
+                ))
             );
             assert_eq!(
-                format_dpi_stage_status(&response, 26000),
+                format_dpi_stage_status(&response, p),
                 Some(format!(
                     "stages=400,800,1600,3200,6400\nactive_stage={active}\n"
                 ))
             );
         }
         for active in [0, 6, 255] {
-            assert!(format_dpi_stage_status(&stage_response(active), 26000).is_none());
+            assert!(format_dpi_stage_info(&stage_response(active), p).is_none());
+            assert!(format_dpi_stage_status(&stage_response(active), p).is_none());
         }
         let mut invalid_count = stage_response(1);
         invalid_count.set_arg(2, 6);
-        assert!(format_dpi_stage_status(&invalid_count, 26000).is_none());
+        assert!(format_dpi_stage_info(&invalid_count, p).is_none());
+        assert!(format_dpi_stage_status(&invalid_count, p).is_none());
     }
 }

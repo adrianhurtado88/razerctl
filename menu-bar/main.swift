@@ -16,6 +16,7 @@ import Carbon
 struct DeviceCapabilities: Decodable {
     var effects: [String] = []
     var brightness = false
+    var dpi_min: Int? = nil
     var dpi_max = 0
     var dpi_stages = false
     var poll_rates: [Int] = []
@@ -68,7 +69,7 @@ final class Store: ObservableObject, Identifiable {
     private let targetID: String?
     var id: String { targetID ?? "discovery" }
     var capabilities: DeviceCapabilities { detectedDevice?.capabilities ?? DeviceCapabilities() }
-    var dpiMinimum: Int { detectedDevice?.transport == "bluetooth" ? 100 : 1 }
+    var dpiMinimum: Int { capabilities.dpi_min ?? 100 }
     private weak var discoveryStore: Store?
     private var detectionTimer: Timer?
     private var inventorySignature: String?
@@ -676,8 +677,21 @@ final class Store: ObservableObject, Identifiable {
         command(["brightness", String(Int(pct)), "--dev", device])
     }
 
+    func validatedDpi(_ text: String) -> Int? {
+        guard capabilities.dpi_max > 0,
+              let value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              value >= dpiMinimum, value <= capabilities.dpi_max else { return nil }
+        return value
+    }
+
     func setDpi(_ value: String) {
-        command(["dpi", value])
+        guard let dpi = validatedDpi(value) else {
+            commandError = capabilities.dpi_max > 0
+                ? "Choose a DPI between \(dpiMinimum) and \(capabilities.dpi_max)."
+                : "DPI controls are unavailable for this device."
+            return
+        }
+        command(["dpi", String(dpi)])
     }
 
     func setPoll(_ hz: String) {
@@ -1437,12 +1451,11 @@ private struct MousePerformance: View {
 
     private var stages: [String] {
         (store.status["stages"] ?? "400,800,1600,3200,6400")
-            .split(separator: ",").map(String.init).filter { (Int($0) ?? 0) <= store.capabilities.dpi_max }
+            .split(separator: ",").map(String.init).filter { store.validatedDpi($0) != nil }
     }
     private var isCustomDpi: Bool { !stages.contains(store.status["dpi"] ?? "") }
     private var validCustomDpi: Bool {
-        guard let value = Int(customDpi.trimmingCharacters(in: .whitespaces)) else { return false }
-        return value >= store.dpiMinimum && value <= store.capabilities.dpi_max
+        store.validatedDpi(customDpi) != nil
     }
 
     var body: some View {

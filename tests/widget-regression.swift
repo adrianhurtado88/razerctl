@@ -86,6 +86,8 @@ check(actionStore.kbdBrightness == 100 && detectedMouseStore.mouseBrightness == 
 check(actionStore.kbdEffect.isEmpty, "Detection must not pretend to read the current effect")
 check(viperStore.capabilities.effects.isEmpty && !viperStore.capabilities.scroll)
 check(viperStore.capabilities.dpi_max == 30000)
+check(detectedMouseStore.capabilities.dpi_min == nil && detectedMouseStore.dpiMinimum == 100,
+      "Legacy device metadata must use the supported 100 DPI minimum")
 check(actionStore.shortcuts === discoveryStore.shortcuts && detectedMouseStore.mouseButtons === discoveryStore.mouseButtons,
       "Device sections must share the app's existing shortcut and mouse assignment stores")
 check(!discoveryStore.deviceStores[3].detectedDevice!.supported)
@@ -477,4 +479,44 @@ check(effectMenu.itemTitles == ["Spectrum", "Static", "Off"])
 effectMenu.selectItem(at: 1)
 effectMenu.sendAction(effectMenu.action, to: effectMenu.target)
 check(selectedEffect == "static")
-print("Passed: automatic/manual discovery, capability gates, multiple device targets, reconnects, empty/unknown/permission/failure states, static colors and debounce, device actions, slider/keyboard/AX commits, effect menus, secure-input transitions, temporary privacy ownership/timeout/failure/cleanup, shared privacy across device rescans/removal/reconnection. No hardware accessed; secure-input enable/disable APIs were faked.")
+
+func dpiBoundsDevice(minimum: Int?, maximum: Int) throws -> DetectedDevice {
+    var fixture = fixtureDevice("dpi-bounds", kind: "mouse", name: "DPI fixture", dpi: maximum)
+    var capabilities = fixture["capabilities"] as! [String: Any]
+    if let minimum { capabilities["dpi_min"] = minimum }
+    fixture["capabilities"] = capabilities
+    return try JSONDecoder().decode(DetectedDevice.self, from: JSONSerialization.data(withJSONObject: fixture))
+}
+let dpiBoundsStore = Store(targetID: "dpi-bounds")
+dpiBoundsStore.detectedDevice = try dpiBoundsDevice(minimum: 100, maximum: 26000)
+check(dpiBoundsStore.capabilities.dpi_min == 100 && dpiBoundsStore.dpiMinimum == 100)
+check(dpiBoundsStore.validatedDpi(" \t100\n") == 100 && dpiBoundsStore.validatedDpi("26000") == 26000)
+let beforeInvalidUSB = commands()
+for invalid in ["0", "1", "99", "26001", "-1", "100.5", "bad", "", "999999999999999999999"] {
+    check(dpiBoundsStore.validatedDpi(invalid) == nil)
+    dpiBoundsStore.setDpi(invalid)
+}
+settle(dpiBoundsStore)
+check(commands() == beforeInvalidUSB && dpiBoundsStore.commandError?.contains("100") == true,
+      "Invalid DPI text must be rejected before launching the USB core")
+dpiBoundsStore.detectedDevice = try dpiBoundsDevice(minimum: 200, maximum: 26000)
+check(dpiBoundsStore.validatedDpi("199") == nil && dpiBoundsStore.validatedDpi("200") == 200,
+      "Published minimum metadata must control validation")
+dpiBoundsStore.setDpi("199")
+dpiBoundsStore.detectedDevice = try dpiBoundsDevice(minimum: 0, maximum: 0)
+for invalid in ["0", "100"] {
+    check(dpiBoundsStore.validatedDpi(invalid) == nil)
+    dpiBoundsStore.setDpi(invalid)
+}
+settle(dpiBoundsStore)
+check(commands() == beforeInvalidUSB && dpiBoundsStore.commandError?.contains("unavailable") == true,
+      "A device without DPI capabilities must reject zero even when its published minimum is zero")
+dpiBoundsStore.detectedDevice = try dpiBoundsDevice(minimum: 100, maximum: 26000)
+dpiBoundsStore.setDpi(" \t100\n")
+dpiBoundsStore.setDpi("26000")
+settle(dpiBoundsStore)
+check(Array(commands().dropFirst(beforeInvalidUSB.count)) == ["dpi 100 --id dpi-bounds", "dpi 26000 --id dpi-bounds"],
+      "Valid trimmed input and both model boundaries must reach the selected USB target")
+check(dpiBoundsStore.commandError == nil)
+
+print("Passed: automatic/manual discovery, capability gates, multiple device targets, reconnects, empty/unknown/permission/failure states, static colors and debounce, device actions, DPI metadata/boundaries/invalid USB suppression, slider/keyboard/AX commits, effect menus, secure-input transitions, temporary privacy ownership/timeout/failure/cleanup, shared privacy across device rescans/removal/reconnection. No hardware accessed; secure-input enable/disable APIs were faked.")

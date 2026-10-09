@@ -73,6 +73,7 @@ final class FakeBluetooth: BluetoothBackend {
 }
 func fakeBluetoothDevice(_ id: String, productID: String = "068E:00BA", name: String = "Razer Basilisk V3 X HyperSpeed") -> DetectedDevice {
     var capabilities = DeviceCapabilities()
+    capabilities.dpi_min = 100
     capabilities.dpi_max = 18000
     capabilities.dpi_stages = true
     capabilities.effects = ["static"]
@@ -98,13 +99,24 @@ settle(bluetoothStore)
 check(bluetoothStore.deviceStores.map(\.id) == ["kbd-1", "usb-same-pid", bleFirstID, bleSecondID],
       "Native UUID entries replace duplicate Bluetooth HID rows but retain USB connections")
 check(bluetoothStore.deviceStores[2].detectedDevice?.connectionLabel == "Bluetooth")
-check(bluetoothStore.deviceStores[2].dpiMinimum == 100 && bluetoothStore.deviceStores[0].dpiMinimum == 1)
+check(bluetoothStore.deviceStores[2].capabilities.dpi_min == 100 && bluetoothStore.deviceStores[2].dpiMinimum == 100)
+check(bluetoothStore.deviceStores[0].validatedDpi("0") == nil,
+      "A keyboard without DPI controls cannot accept zero")
 check(bluetoothStore.deviceStores[2].capabilities.poll_rates.isEmpty)
 check(!bluetoothStore.deviceStores[2].capabilities.scroll)
 let priorUSBCommands = commands()
-bluetoothStore.deviceStores[3].setDpi("1600")
+let secondBluetoothStore = bluetoothStore.deviceStores[3]
+check(secondBluetoothStore.validatedDpi("100") == 100 && secondBluetoothStore.validatedDpi("18000") == 18000)
+for invalid in ["0", "1", "99", "18001", "-1", "100.5", "bad", "", "999999999999999999999"] {
+    secondBluetoothStore.setDpi(invalid)
+}
 settle(bluetoothStore)
-check(fakeBluetooth.calls.count == 1 && fakeBluetooth.calls[0].0 == bleSecondID && fakeBluetooth.calls[0].1.first == "dpi")
+check(fakeBluetooth.calls.isEmpty && commands() == priorUSBCommands,
+      "Invalid DPI text must not reach either the Bluetooth backend or USB core")
+secondBluetoothStore.setDpi(" \t1600\n")
+settle(bluetoothStore)
+check(fakeBluetooth.calls.count == 1 && fakeBluetooth.calls[0].0 == bleSecondID
+      && fakeBluetooth.calls[0].1 == ["dpi", "1600", "--id", bleSecondID])
 check(commands() == priorUSBCommands, "Bluetooth commands must not reach the USB core")
 fakeBluetooth.failure = "The selected Bluetooth device disconnected"
 bluetoothStore.deviceStores[2].setDpi("800")
@@ -122,4 +134,4 @@ bluetoothStore.checkForDeviceChanges()
 settle(bluetoothStore)
 check(bluetoothStore.bluetoothError == nil && bluetoothStore.deviceStores.last?.id == bleFirstID)
 
-print("Passed: Bluetooth packet framing, response correlation, DPI token/axis/marker preservation, invalid data rejection, exact device targeting, connection labels, duplicate handling, permission recovery and USB isolation. No Bluetooth hardware accessed.")
+print("Passed: Bluetooth packet framing, response correlation, DPI token/axis/marker preservation, invalid data rejection, DPI boundaries/invalid dispatch suppression/trimmed inputs, exact device targeting, connection labels, duplicate handling, permission recovery and USB isolation. No Bluetooth hardware accessed.")
