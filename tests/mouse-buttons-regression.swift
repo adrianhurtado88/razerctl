@@ -5,10 +5,14 @@ final class FakeMouseMonitor: MouseButtonMonitoring {
     var isRunning = false
     var starts = 0
     var failStart = false
+    var failNextStart = false
+    var enableOnStart = true
     func start() throws {
         starts += 1
-        if failStart { throw ShortcutFailure("Mouse monitoring unavailable.") }
-        isRunning = true
+        let shouldFail = failStart || failNextStart
+        failNextStart = false
+        if shouldFail { throw ShortcutFailure("Mouse monitoring unavailable.") }
+        isRunning = enableOnStart
     }
     func stop() { isRunning = false }
     @discardableResult
@@ -66,6 +70,9 @@ let mouseStore = MouseButtonsStore(defaults: mouseDefaults, monitor: mouseMonito
 mouseStore.start()
 check(!mouseMonitor.isRunning && mouseMonitor.starts == 0 && mouseStore.activeCount == 0,
       "No mappings means no event monitoring")
+mouseStore.retry()
+check(!mouseStore.accessibilityGranted && mouseStore.monitorError?.contains("quit and reopen") == true,
+      "A denied Retry must explain how to recover an already-enabled permission")
 
 var mouseRule = MouseButtonRule()
 mouseRule.button = 3
@@ -76,9 +83,27 @@ check(!mouseMonitor.isRunning && mouseStore.monitorError != nil,
       "Save without permission, but do not intercept input")
 mouseStore.beginCapture()
 check(!mouseStore.capturing, "Recording requires Accessibility")
+mouseStore.startCheckingAccess()
+mouseRunner.accessibilityGranted = true
+RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+check(mouseMonitor.isRunning && mouseStore.activeCount == 1 && mouseStore.monitorError == nil)
+check(mouseStore.accessibilityGranted,
+      "Granting access in System Settings must recover without an app activation or Retry")
+let cancellationsBeforeAccessCheck = mouseRunner.cancellations
+let startsBeforeAccessCheck = mouseMonitor.starts
+RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+check(mouseRunner.cancellations == cancellationsBeforeAccessCheck && mouseMonitor.starts == startsBeforeAccessCheck,
+      "Unchanged permission checks must not cancel actions or restart a healthy listener")
+mouseStore.stopCheckingAccess()
+mouseRunner.accessibilityGranted = false
+RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+check(mouseStore.accessibilityGranted, "Closing the editor must stop its permission checks")
+mouseStore.startCheckingAccess()
+check(!mouseStore.accessibilityGranted && !mouseMonitor.isRunning,
+      "Reopening the editor must immediately refresh permission and stop a revoked listener")
+mouseStore.stopCheckingAccess()
 mouseRunner.accessibilityGranted = true
 mouseStore.refreshAccess()
-check(mouseMonitor.isRunning && mouseStore.activeCount == 1 && mouseStore.monitorError == nil)
 check(mouseMonitor.input(3, .down) && mouseMonitor.input(3, .drag))
 settleMouseActions()
 check(mouseRunner.performed.isEmpty, "Do not execute before release")
@@ -171,8 +196,17 @@ mouseMonitor.failStart = true
 mouseStore.retry()
 check(!mouseStore.monitoring && mouseStore.monitorError != nil)
 mouseMonitor.failStart = false
+mouseMonitor.enableOnStart = false
+mouseStore.retry()
+check(!mouseStore.monitoring && mouseStore.monitorError != nil,
+      "A tap that stays disabled must not be reported as a successful Retry")
+mouseMonitor.enableOnStart = true
 mouseStore.retry()
 check(mouseStore.monitoring && mouseStore.monitorError == nil)
+let startsBeforeRetry = mouseMonitor.starts
+mouseStore.retry()
+check(mouseMonitor.starts == startsBeforeRetry + 1 && mouseStore.monitoring,
+      "Explicit Retry must rebuild the listener instead of reusing a stale tap")
 mouseMonitor.onIssue?("Accessibility access was removed.")
 check(!mouseMonitor.isRunning && !mouseStore.monitoring && mouseStore.monitorError != nil)
 mouseStore.retry()
@@ -209,5 +243,62 @@ let damagedMouseStore = MouseButtonsStore(defaults: damagedMouseDefaults,
 check(damagedMouseStore.storageError != nil)
 rejectsShortcut("Unreadable mouse settings must be preserved") { try damagedMouseStore.save(mouseRule) }
 check(damagedMouseDefaults.data(forKey: "mouseButtonRules.v1") == damagedMouseData)
+
+// The first assignment can fail during recording before there are any saved rules.
+let captureFailureSuite = mouseSuite + ".capture"
+let captureFailureDefaults = UserDefaults(suiteName: captureFailureSuite)!
+defer { captureFailureDefaults.removePersistentDomain(forName: captureFailureSuite) }
+let captureFailureMonitor = FakeMouseMonitor()
+captureFailureMonitor.failStart = true
+let captureFailureRunner = FakeShortcutRunner()
+captureFailureRunner.accessibilityGranted = true
+let captureFailureStore = MouseButtonsStore(defaults: captureFailureDefaults,
+                                          monitor: captureFailureMonitor, runner: captureFailureRunner)
+captureFailureStore.start()
+captureFailureStore.beginCapture()
+check(!captureFailureStore.capturing && captureFailureStore.monitorError != nil,
+      "A failed first recording must keep its error visible so the user can retry")
+let startsBeforeFailedCaptureRetry = captureFailureMonitor.starts
+captureFailureStore.retry()
+check(captureFailureMonitor.starts > startsBeforeFailedCaptureRetry
+      && !captureFailureStore.monitoring && captureFailureStore.monitorError != nil,
+      "Retry must attempt the failed recording and retain its error while start still fails")
+captureFailureMonitor.failStart = false
+captureFailureStore.retry()
+check(captureFailureStore.capturing && captureFailureStore.monitoring && captureFailureStore.monitorError == nil,
+      "Retry must resume the failed first recording without another Record click")
+captureFailureStore.cancelCapture()
+
+captureFailureMonitor.failStart = true
+captureFailureStore.beginCapture()
+captureFailureStore.cancelCapture()
+captureFailureMonitor.failStart = false
+let startsBeforeCancelledCaptureRetry = captureFailureMonitor.starts
+captureFailureStore.retry()
+check(!captureFailureStore.capturing && captureFailureMonitor.starts == startsBeforeCancelledCaptureRetry,
+      "Cancelling a failed recording must clear its pending Retry")
+
+try captureFailureStore.save(mouseRule)
+captureFailureMonitor.stop()
+captureFailureMonitor.failNextStart = true
+captureFailureStore.beginCapture()
+check(!captureFailureStore.capturing && captureFailureStore.monitoring
+      && captureFailureStore.monitorError == nil && captureFailureStore.activeCount == 1,
+      "A failed recording must not hide successfully restored saved assignments")
+check(captureFailureStore.actionError != nil,
+      "A recording failure must remain visible separately from a healthy listener")
+check(captureFailureMonitor.input(3, .down) && captureFailureMonitor.input(3, .up))
+settleMouseActions()
+check(captureFailureRunner.performed == [mouseRule.assignment],
+      "Restored assignments must still execute after a transient recording failure")
+captureFailureStore.beginCapture()
+check(captureFailureStore.capturing && captureFailureStore.monitoring && captureFailureStore.actionError == nil)
+captureFailureStore.cancelCapture()
+captureFailureStore.startCheckingAccess()
+captureFailureStore.stop()
+captureFailureRunner.accessibilityGranted = false
+RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+check(captureFailureStore.accessibilityGranted,
+      "Stopping the store must invalidate the editor's permission checks")
 
 print("Passed: mouse click pairing, routing, capture, edit/delete during click, queued-action cancellation, pause/disable, permission/retry handling, validation and persistence. No mouse events intercepted or actions posted.")

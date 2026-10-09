@@ -81,6 +81,7 @@ while RazerCtl is running, independently of the device control profiles.
 - Mouse button assignments with recording, individual enable controls and pause
 - Device commands run on a serial background queue
 - Built-in GitHub release checks and update installation
+- Temporary keyboard privacy with a ten-minute shutoff and macOS secure-input status
 - Includes the full `razerctl` CLI for scripting
 
 ## Install
@@ -138,6 +139,27 @@ use:
 Mouse lighting, DPI, polling rate and scroll-mode controls do not require the
 keyboard's Input Monitoring grant. Keyboard assignments that open an app or
 website do not require Accessibility.
+
+## Keyboard privacy
+
+Under each supported keyboard, the Secure Keyboard Entry switch enables
+macOS Secure Keyboard Entry for up to ten minutes, with a visible countdown.
+The timer continues when the panel closes. RazerCtl releases its request on
+sleep, user switching or quitting; the setting is not saved across launches.
+The More menu also offers Turn Off Temporary Privacy while it is active.
+
+The Secure Keyboard Entry status is system-wide: another app can keep it
+active after RazerCtl's switch is turned off. RazerCtl only releases its own
+request. Status is checked once a second while the panel is open or temporary
+mode is active. Open the ⓘ information popover for the disclaimer and details.
+
+RazerCtl does not keep a typing log and **cannot guarantee completely
+untraceable typing**. Secure Keyboard Entry can help block other apps from
+capturing typing, but the receiving app can still read or save input,
+including in command history. It may interrupt keyboard shortcuts, remapping
+and accessibility tools. Apple recommends secure input be enabled by the app
+receiving sensitive typing; in Terminal, choose **Terminal → Secure Keyboard
+Entry** ([Apple’s guide](https://support.apple.com/guide/terminal/use-secure-keyboard-entry-trml109/mac)).
 
 ## Custom keyboard shortcuts
 

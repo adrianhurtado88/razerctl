@@ -24,6 +24,10 @@ including two identical supported devices. The widget attaches that ID
 to every setting command, including custom colors and rainbow lighting;
 disconnecting one device cannot redirect its commands to another.
 
+Keyboard privacy remains app-wide: every keyboard section observes the same
+owner used by the panel and sleep/session/quit cleanup. Device rescans and
+disconnects do not create or release secure-input requests or App Nap protection.
+
 The catalog has 14 product variants:
 
 - Ornata V3 X: 0294, 02A2; spectrum, breath, static, off, brightness.

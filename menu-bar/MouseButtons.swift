@@ -103,10 +103,8 @@ final class MacMouseButtonMonitor: MouseButtonMonitoring {
         guard AXIsProcessTrusted() else {
             throw ShortcutFailure("Allow Accessibility to customise mouse buttons.")
         }
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: true)
-            return
-        }
+        // A disabled tap can outlive a permission change. Retry with a fresh one.
+        stop()
         let mask = [CGEventType.otherMouseDown, .otherMouseUp, .otherMouseDragged]
             .reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
@@ -174,6 +172,8 @@ final class MouseButtonsStore: ObservableObject {
     private var started = false
     private var outputRecordingDepth = 0
     private var captureTimeout: DispatchWorkItem?
+    private var captureNeedsRetry = false
+    private var accessTimer: Timer?
     private var generation = UUID()
     private let rulesKey = "mouseButtonRules.v1"
 
@@ -218,7 +218,9 @@ final class MouseButtonsStore: ObservableObject {
 
     func stop() {
         started = false
+        stopCheckingAccess()
         capturing = false
+        captureNeedsRetry = false
         captureTimeout?.cancel()
         runner.cancel()
         generation = UUID()
@@ -239,7 +241,11 @@ final class MouseButtonsStore: ObservableObject {
 
     func setOutputRecording(_ recording: Bool) {
         guard recording || outputRecordingDepth > 0 else { return }
-        if recording { capturing = false; captureTimeout?.cancel() }
+        if recording {
+            capturing = false
+            captureNeedsRetry = false
+            captureTimeout?.cancel()
+        }
         outputRecordingDepth += recording ? 1 : -1
         onKeyRecordingChanged?(recording)
         configure()
@@ -253,7 +259,37 @@ final class MouseButtonsStore: ObservableObject {
         configure()
     }
 
-    func retry() { accessibilityGranted = runner.accessibilityGranted; configure() }
+    func startCheckingAccess() {
+        refreshAccess()
+        guard accessTimer == nil else { return }
+        // The system permission prompt is asynchronous. Menu-bar apps do not
+        // necessarily become active again when the user changes System Settings.
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshAccess()
+        }
+        accessTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func stopCheckingAccess() {
+        accessTimer?.invalidate()
+        accessTimer = nil
+    }
+
+    func retry() {
+        monitor.stop()
+        monitoring = false
+        accessibilityGranted = runner.accessibilityGranted
+        if !accessibilityGranted { router.reset() }
+        if captureNeedsRetry && started && accessibilityGranted {
+            beginCapture()
+            return
+        }
+        configure()
+        if !accessibilityGranted {
+            monitorError = "Accessibility is still unavailable to this copy of RazerCtl. If it is already enabled in System Settings, quit and reopen RazerCtl, then try again."
+        }
+    }
 
     func requestAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
@@ -270,9 +306,21 @@ final class MouseButtonsStore: ObservableObject {
         }
         capturedButton = nil
         actionError = nil
+        captureNeedsRetry = false
         capturing = true
         configure()
-        guard monitoring else { capturing = false; configure(); return }
+        guard monitoring else {
+            let issue = monitorError
+            capturing = false
+            configure()
+            if monitoring {
+                actionError = "Mouse button recording failed. \(issue ?? "Try recording again.")"
+            } else {
+                captureNeedsRetry = true
+                monitorError = issue
+            }
+            return
+        }
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.capturing else { return }
             self.cancelCapture()
@@ -287,6 +335,7 @@ final class MouseButtonsStore: ObservableObject {
         captureTimeout?.cancel()
         captureTimeout = nil
         capturing = false
+        captureNeedsRetry = false
         configure()
     }
 
@@ -318,9 +367,13 @@ final class MouseButtonsStore: ObservableObject {
         }
         do {
             if !monitor.isRunning { try monitor.start() }
+            guard monitor.isRunning else {
+                throw ShortcutFailure("Mouse button handling did not start. Check Accessibility access and choose Retry.")
+            }
             monitoring = monitor.isRunning
             monitorError = nil
         } catch {
+            monitor.stop()
             monitoring = false
             monitorError = error.localizedDescription
         }
@@ -355,6 +408,7 @@ final class MouseButtonsStore: ObservableObject {
     func save(_ rule: MouseButtonRule) throws {
         guard storageError == nil else { throw ShortcutFailure(storageError!) }
         try MouseButtonRule.validate(rule, among: rules)
+        captureNeedsRetry = false
         if let index = rules.firstIndex(where: { $0.id == rule.id }) { rules[index] = rule }
         else { rules.append(rule) }
         persist()
@@ -363,6 +417,7 @@ final class MouseButtonsStore: ObservableObject {
 
     func remove(_ id: UUID) {
         guard storageError == nil else { return }
+        captureNeedsRetry = false
         rules.removeAll { $0.id == id }
         persist()
         configure()
@@ -371,6 +426,8 @@ final class MouseButtonsStore: ObservableObject {
     private func persist() {
         if let data = try? JSONEncoder().encode(rules) { defaults.set(data, forKey: rulesKey) }
     }
+
+    deinit { accessTimer?.invalidate() }
 }
 
 // MARK: - Editor
@@ -415,13 +472,18 @@ final class MouseButtonsWindow: NSWindowController, NSWindowDelegate {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func show() {
+        buttons.startCheckingAccess()
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }
     func windowWillClose(_ notification: Notification) {
+        buttons.stopCheckingAccess()
         window?.makeFirstResponder(nil)
         buttons.cancelCapture()
+    }
+    func windowDidBecomeKey(_ notification: Notification) {
+        buttons.refreshAccess()
     }
     func windowDidResignKey(_ notification: Notification) {
         window?.makeFirstResponder(nil)
