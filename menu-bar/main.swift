@@ -343,6 +343,7 @@ final class Store: ObservableObject, Identifiable {
     /// check — and the shared team is what keeps the Input Monitoring
     /// grant alive across updates), swap bundles, relaunch.
     func performUpdate() {
+        guard !updating else { return }
         guard let assetURL else {
             updateError = "No downloadable asset found"
             return
@@ -356,34 +357,27 @@ final class Store: ObservableObject, Identifiable {
                 // 2. Unzip to a fresh temp dir.
                 let tmp = NSTemporaryDirectory() + "razerctl-update-\(UUID().uuidString)"
                 try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(atPath: tmp) }
                 try Self.runCmd("/usr/bin/ditto", ["-x", "-k", zipURL.path, tmp])
                 let newApp = tmp + "/RazerCtl.app"
-                guard FileManager.default.fileExists(atPath: newApp + "/Contents/MacOS/RazerCtl") else {
+                let staged = URL(fileURLWithPath: newApp)
+                guard let version = Bundle(url: staged)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
                     throw UpdateError.badArchive
                 }
+                try AppUpdate.requireExecutables(at: staged)
                 // 3. Verify integrity and the current app's signing identity.
                 try AppUpdate.verifySignature(at: URL(fileURLWithPath: newApp),
                                               matching: Bundle.main.bundleURL)
-                // 4. Swap: current -> .old, new -> current. The running
-                //    process keeps its image; macOS allows this.
-                let bundle = Bundle.main.bundlePath
-                let parent = (bundle as NSString).deletingLastPathComponent
-                let old = parent + "/RazerCtl.old.app"
-                try? FileManager.default.removeItem(atPath: old)
-                try FileManager.default.moveItem(atPath: bundle, toPath: old)
-                try FileManager.default.moveItem(atPath: newApp, toPath: bundle)
-                // 5. The downloaded file is quarantined; this app is not
-                //    notarized, so clear it or Gatekeeper blocks relaunch.
+                // 4. Prepare the staged app before touching the installed one.
                 try Self.runCmd("/usr/bin/xattr",
-                                 ["-dr", "com.apple.quarantine", bundle])
-                // 6. Launch the new version, then exit this one. The new
-                //    instance deletes the .old bundle, clears the download
-                //    temp dir, and shows an "Updated" confirmation.
-                UserDefaults.standard.set(self?.latestVersion ?? Self.appVersion,
-                                          forKey: "didSelfUpdateTo")
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: bundle + "/Contents/MacOS/RazerCtl")
-                try p.run()
+                                 ["-dr", "com.apple.quarantine", newApp])
+                // 5. Restore the original on failure; retain its backup until
+                //    the new instance confirms startup at the installed path.
+                try AppUpdate.install(staged: staged, current: Bundle.main.bundleURL, version: version) { bundle in
+                    let process = Process()
+                    process.executableURL = bundle.appendingPathComponent("Contents/MacOS/RazerCtl")
+                    try process.run()
+                }
                 DispatchQueue.main.async { NSApp.terminate(nil) }
             } catch {
                 DispatchQueue.main.async { [weak self] in
@@ -1632,19 +1626,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         statusItem = item
 
-        // Self-update housekeeping: remove the replaced bundle left by a
-        // previous update (this instance is already running from it) and
-        // any download temp dirs.
-        let oldBundle = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
-            + "/RazerCtl.old.app"
-        try? FileManager.default.removeItem(atPath: oldBundle)
-        let tmp = NSTemporaryDirectory()
-        if let leftovers = try? FileManager.default.contentsOfDirectory(atPath: tmp) {
-            for item in leftovers where item.hasPrefix("razerctl-update-") {
-                try? FileManager.default.removeItem(atPath: tmp + item)
-            }
-        }
-
         // .applicationDefined: stays open when focus moves elsewhere —
         // .transient auto-dismisses on ANY focus change, which made the
         // panel vanish the instant a screenshot tool (or any other app)
@@ -1695,6 +1676,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // If this instance was just installed by a self-update, show the
         // confirmation and open the panel automatically.
+        if let confirmed = AppUpdate.finishInstallation(current: Bundle.main.bundleURL, version: Store.appVersion) {
+            UserDefaults.standard.set(confirmed, forKey: "didSelfUpdateTo")
+        }
         if let updatedTo = UserDefaults.standard.string(forKey: "didSelfUpdateTo") {
             UserDefaults.standard.removeObject(forKey: "didSelfUpdateTo")
             store.updateCompleted = updatedTo

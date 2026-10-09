@@ -10,6 +10,12 @@ let testApp = NSApplication.shared
 testApp.setActivationPolicy(.prohibited)
 testApp.appearance = NSAppearance(named: .darkAqua)
 let testDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+let updatingStore = Store()
+updatingStore.updating = true
+updatingStore.updateError = "existing transaction"
+updatingStore.performUpdate()
+check(updatingStore.updating && updatingStore.updateError == "existing transaction",
+      "A repeated update request must not start or disturb an in-flight transaction")
 let stubURL = testDirectory.appendingPathComponent("razerctl-core")
 let stub = #"""
 #!/bin/sh
