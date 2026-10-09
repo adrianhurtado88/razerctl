@@ -86,7 +86,7 @@ while RazerCtl is running, independently of the device control profiles.
 
 ## Install
 
-The v1.5 download is an **Apple silicon** build for **macOS 27 or later**.
+The v1.6 download is an **Apple silicon** build for **macOS 27 or later**.
 Intel builds and builds for older macOS versions are unverified.
 
 ### Download the app
