@@ -148,7 +148,7 @@ pub fn get_dpi_xy(txid: u8) -> Report {
 }
 
 /// Configure the onboard DPI stages (cycle with the DPI stage button).
-/// `stages` holds 2..=5 DPI values; `active` is the 0-based stage to activate.
+/// `stages` holds 2..=5 DPI values; `active` is the 1-based stage to activate.
 pub fn set_dpi_stages(txid: u8, active: u8, stages: &[u16]) -> Report {
     let count = stages.len().min(5) as u8;
     let mut r = Report::new(txid, 0x04, 0x06, 0x26);
@@ -266,7 +266,11 @@ pub fn keyboard_effect(txid: u8, led: u8, effect: Effect) -> Report {
 pub fn mouse_effect(txid: u8, led: u8, effect: Effect) -> Report {
     // Wave is special on mice: OpenRazer's wave_common sends it with
     // transaction id 0x3F even on 0x1F-generation devices.
-    let txid = if matches!(effect, Effect::Wave(_)) { 0x3F } else { txid };
+    let txid = if matches!(effect, Effect::Wave(_)) {
+        0x3F
+    } else {
+        txid
+    };
     let (data_size, effect_id) = match effect {
         Effect::None => (0x06, 0x00),
         Effect::Static(_) => (0x09, 0x01),
