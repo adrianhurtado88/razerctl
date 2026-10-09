@@ -34,7 +34,8 @@ pub struct Profile {
     pub txid: u8,
     /// Device kind.
     pub kind: Kind,
-    /// Maximum DPI (mice).
+    /// Minimum and maximum DPI (zero for keyboards).
+    pub dpi_min: u16,
     pub dpi_max: u16,
     pub effects: &'static [&'static str],
     pub scroll: bool,
@@ -46,6 +47,10 @@ pub struct Profile {
 impl Profile {
     pub fn is_mouse(&self) -> bool {
         self.kind == Kind::Mouse
+    }
+
+    pub fn valid_dpi(&self, value: u16) -> bool {
+        self.dpi_max > 0 && (self.dpi_min..=self.dpi_max).contains(&value)
     }
 
     pub fn matches(&self, info: &DeviceInfo) -> bool {
@@ -108,6 +113,7 @@ const fn keyboard(
         usage: if interface == 2 { 2 } else { 1 },
         txid: 0x1F,
         kind: Kind::Keyboard,
+        dpi_min: 0,
         dpi_max: 0,
         effects,
         scroll: false,
@@ -125,6 +131,7 @@ const fn performance_mouse(pid: u16, name: &'static str, dpi_max: u16) -> Profil
         usage: 2,
         txid: 0x1F,
         kind: Kind::Mouse,
+        dpi_min: 100,
         dpi_max,
         effects: &[],
         scroll: false,
@@ -155,6 +162,7 @@ pub const PROFILES: &[Profile] = &[
         usage: 0x0001,
         txid: 0x1F,
         kind: Kind::Mouse,
+        dpi_min: 100,
         dpi_max: 26000,
         effects: &["spectrum", "wave", "rainbow", "static", "none"],
         scroll: true,
@@ -522,6 +530,23 @@ pub fn probe_all(api: &HidApi) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_dpi_bounds_match_device_capabilities() {
+        for p in PROFILES {
+            if p.is_mouse() {
+                assert_eq!(p.dpi_min, 100);
+                assert!(p.valid_dpi(p.dpi_min));
+                assert!(p.valid_dpi(p.dpi_max));
+                assert!(!p.valid_dpi(99));
+                assert!(!p.valid_dpi(p.dpi_max + 1));
+            } else {
+                assert_eq!((p.dpi_min, p.dpi_max), (0, 0));
+                assert!(!p.valid_dpi(0));
+                assert!(!p.valid_dpi(100));
+            }
+        }
+    }
 
     #[test]
     fn only_exact_catalogued_control_collections_match() {

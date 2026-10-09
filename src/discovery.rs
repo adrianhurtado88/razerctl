@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 pub struct Capabilities {
     pub effects: Vec<&'static str>,
     pub brightness: bool,
+    pub dpi_min: u16,
     pub dpi_max: u16,
     pub dpi_stages: bool,
     pub poll_rates: Vec<u16>,
@@ -22,6 +23,7 @@ impl Capabilities {
         Self {
             effects: p.effects.to_vec(),
             brightness: !p.effects.is_empty(),
+            dpi_min: p.dpi_min,
             dpi_max: p.dpi_max,
             dpi_stages: p.is_mouse(),
             poll_rates: if p.is_mouse() {
@@ -42,6 +44,7 @@ impl Capabilities {
             "kbd_brightness"
         });
         if !settings.contains_key("dpi") {
+            self.dpi_min = 0;
             self.dpi_max = 0;
         }
         self.dpi_stages &= settings.contains_key("stages");
@@ -256,10 +259,24 @@ mod tests {
         let mut caps = Capabilities::for_profile(p);
         assert!(caps.effects.is_empty());
         assert!(!caps.brightness && !caps.scroll && caps.zones == 0);
+        assert_eq!(caps.dpi_min, 100);
         assert_eq!(caps.dpi_max, 30000);
         caps.retain_readable(&BTreeMap::new(), p.kind);
+        assert_eq!(caps.dpi_min, 0);
         assert_eq!(caps.dpi_max, 0);
         assert!(!caps.dpi_stages && caps.poll_rates.is_empty());
+    }
+
+    #[test]
+    fn dpi_bounds_are_published_in_capability_metadata() {
+        for p in PROFILES {
+            let caps = serde_json::to_value(Capabilities::for_profile(p)).unwrap();
+            assert_eq!(caps["dpi_min"], p.dpi_min);
+            assert_eq!(caps["dpi_max"], p.dpi_max);
+        }
+        let unknown = serde_json::to_value(Capabilities::default()).unwrap();
+        assert_eq!(unknown["dpi_min"], 0);
+        assert_eq!(unknown["dpi_max"], 0);
     }
 
     #[test]
