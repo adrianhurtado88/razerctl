@@ -502,7 +502,8 @@ final class MouseButtonsWindow: NSWindowController, NSWindowDelegate {
     }
     func windowDidResignKey(_ notification: Notification) {
         window?.makeFirstResponder(nil)
-        buttons.cancelCapture()
+        // Settings may take focus while a failed capture awaits permission.
+        if buttons.capturing { buttons.cancelCapture() }
     }
 }
 
