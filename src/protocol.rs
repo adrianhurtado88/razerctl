@@ -201,7 +201,7 @@ pub enum Effect {
     None,
     Static(Rgb),
     Spectrum,
-    /// Wave direction: 0 = left, 1 = right (keyboards).
+    /// Wave direction, mapped to the model's wire codes by the caller.
     Wave(u8),
     BreathRandom,
     BreathSingle(Rgb),
