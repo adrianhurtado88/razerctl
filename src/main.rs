@@ -583,6 +583,23 @@ fn parse_effect(args: &[&str]) -> Result<Effect, String> {
     }
 }
 
+fn profile_effect_report(p: &devices::Profile, effect: Effect, led: Option<u8>) -> Report {
+    match p.kind {
+        Kind::Keyboard => {
+            let effect = match effect {
+                Effect::Wave(direction) => Effect::Wave(if matches!(p.pid, 0x02A1 | 0x028F) {
+                    direction ^ 3 // Ornata V3 reverses 1/2 direction codes.
+                } else {
+                    direction
+                }),
+                other => other,
+            };
+            keyboard_effect(p.txid, LED_BACKLIGHT, effect)
+        }
+        Kind::Mouse => mouse_effect(p.txid, led.unwrap_or(LED_ALL), effect),
+    }
+}
+
 fn cmd_effect(
     handles: &[Handle],
     args: &[&str],
@@ -599,20 +616,7 @@ fn cmd_effect(
                 continue;
             }
         }
-        let report = match p.kind {
-            Kind::Keyboard => {
-                let effect = match effect {
-                    Effect::Wave(direction) => Effect::Wave(if matches!(p.pid, 0x02A1 | 0x028F) {
-                        direction ^ 3 // Ornata V3 reverses 1/2 direction codes.
-                    } else {
-                        direction - 1
-                    }), // Other extended keyboards use 0/1.
-                    other => other,
-                };
-                keyboard_effect(p.txid, LED_BACKLIGHT, effect)
-            }
-            Kind::Mouse => mouse_effect(p.txid, led.unwrap_or(LED_ALL), effect),
-        };
+        let report = profile_effect_report(p, effect, led);
         h.execute(report).map_err(|e| format!("{}: {e}", p.name))?;
         out.push_str(&format!("✓ {}: effect → {}\n", p.name, effect.name()));
         targeted += 1;
@@ -746,6 +750,68 @@ mod tests {
         assert!(validate_command(profile(0x026B), "effect", &["wave"]).is_ok());
         assert!(validate_command(profile(0x0099), "effect", &["breath"]).is_err());
         assert!(validate_command(profile(0x0099), "rainbow", &[]).is_ok());
+    }
+
+    #[test]
+    fn wave_packets_use_model_directions_and_transaction_ids() {
+        // OpenRazer's model definitions use 1/2 for these profiles; only
+        // full-size Ornata V3 reverses them before building the USB packet.
+        let cases = [
+            (0x02A1, 2, 1, 0x1F, LED_BACKLIGHT),
+            (0x028F, 2, 1, 0x1F, LED_BACKLIGHT),
+            (0x02A3, 1, 2, 0x1F, LED_BACKLIGHT),
+            (0x026B, 1, 2, 0x1F, LED_BACKLIGHT),
+            (0x026C, 1, 2, 0x1F, LED_BACKLIGHT),
+            (0x0099, 1, 2, 0x3F, LED_ALL),
+        ];
+        let wave_profiles: Vec<_> = PROFILES
+            .iter()
+            .filter(|p| p.effects.contains(&"wave"))
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(wave_profiles, cases.iter().map(|c| c.0).collect::<Vec<_>>());
+
+        for (pid, left, right, txid, led) in cases {
+            for (args, direction) in [
+                (vec!["wave"], left),
+                (vec!["wave", "left"], left),
+                (vec!["wave", "right"], right),
+            ] {
+                let effect = parse_effect(&args).unwrap();
+                let report = profile_effect_report(profile(pid), effect, None).finalize();
+                assert_eq!(
+                    &report.bytes[..14],
+                    &[0, txid, 0, 0, 0, 0x06, 0x0F, 0x02, 1, led, 4, direction, 0x28, 0],
+                    "wrong wave packet for product {pid:04X}, {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn profile_effect_reports_preserve_static_colors_and_led_targets() {
+        let effect = parse_effect(&["static", "112233"]).unwrap();
+        for (pid, expected_led) in [(0x026B, LED_BACKLIGHT), (0x0099, LED_LOGO)] {
+            let report = profile_effect_report(profile(pid), effect, Some(LED_LOGO)).finalize();
+            assert_eq!(report.bytes[1], 0x1F);
+            assert_eq!(
+                &report.bytes[5..17],
+                &[
+                    0x09,
+                    0x0F,
+                    0x02,
+                    1,
+                    expected_led,
+                    1,
+                    0,
+                    0,
+                    1,
+                    0x11,
+                    0x22,
+                    0x33
+                ]
+            );
+        }
     }
 
     #[test]

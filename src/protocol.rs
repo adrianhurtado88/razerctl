@@ -201,7 +201,7 @@ pub enum Effect {
     None,
     Static(Rgb),
     Spectrum,
-    /// Wave direction: 0 = left, 1 = right (keyboards).
+    /// Wave direction, mapped to the model's wire codes by the caller.
     Wave(u8),
     BreathRandom,
     BreathSingle(Rgb),
@@ -266,7 +266,11 @@ pub fn keyboard_effect(txid: u8, led: u8, effect: Effect) -> Report {
 pub fn mouse_effect(txid: u8, led: u8, effect: Effect) -> Report {
     // Wave is special on mice: OpenRazer's wave_common sends it with
     // transaction id 0x3F even on 0x1F-generation devices.
-    let txid = if matches!(effect, Effect::Wave(_)) { 0x3F } else { txid };
+    let txid = if matches!(effect, Effect::Wave(_)) {
+        0x3F
+    } else {
+        txid
+    };
     let (data_size, effect_id) = match effect {
         Effect::None => (0x06, 0x00),
         Effect::Static(_) => (0x09, 0x01),
