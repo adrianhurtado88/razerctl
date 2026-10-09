@@ -330,6 +330,7 @@ final class KeyboardShortcutsStore: ObservableObject {
     @Published private(set) var storageError: String?
     @Published var actionError: String?
     @Published var accessibilityGranted = false
+    var onRecordingChanged: ((Bool) -> Void)?
     private let defaults: UserDefaults
     private let registrar: ShortcutRegistering
     private let runner: ShortcutActionRunning
@@ -364,6 +365,8 @@ final class KeyboardShortcutsStore: ObservableObject {
         return rules.filter { $0.enabled && errors[$0.id] == nil }.count
     }
 
+    var isRecording: Bool { recordingDepth > 0 }
+
     func start() {
         started = true
         synchronize()
@@ -382,7 +385,10 @@ final class KeyboardShortcutsStore: ObservableObject {
     }
 
     func setRecording(_ recording: Bool) {
-        recordingDepth = max(0, recordingDepth + (recording ? 1 : -1))
+        guard recording || recordingDepth > 0 else { return }
+        let wasRecording = isRecording
+        recordingDepth += recording ? 1 : -1
+        if isRecording != wasRecording { onRecordingChanged?(isRecording) }
         synchronize()
     }
 
