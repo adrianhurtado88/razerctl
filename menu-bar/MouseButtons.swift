@@ -171,6 +171,7 @@ final class MouseButtonsStore: ObservableObject {
     private let router = MouseButtonRouter()
     private var started = false
     private var outputRecordingDepth = 0
+    private var keyboardRecording = false
     private var captureTimeout: DispatchWorkItem?
     private var captureNeedsRetry = false
     private var accessTimer: Timer?
@@ -209,7 +210,7 @@ final class MouseButtonsStore: ObservableObject {
     }
 
     var activeCount: Int {
-        guard started, !paused, outputRecordingDepth == 0, !capturing,
+        guard started, !paused, outputRecordingDepth == 0, !keyboardRecording, !capturing,
               monitoring, monitorError == nil else { return 0 }
         return rules.filter { $0.assignment.enabled && ruleErrors[$0.id] == nil }.count
     }
@@ -248,6 +249,14 @@ final class MouseButtonsStore: ObservableObject {
         }
         outputRecordingDepth += recording ? 1 : -1
         onKeyRecordingChanged?(recording)
+        configure()
+    }
+
+    // This is aggregate state from the keyboard store, not a local recorder.
+    // Keep it separate so forwarding mouse output recording cannot recurse.
+    func setKeyboardRecording(_ recording: Bool) {
+        guard keyboardRecording != recording else { return }
+        keyboardRecording = recording
         configure()
     }
 
@@ -344,7 +353,7 @@ final class MouseButtonsStore: ObservableObject {
         runner.cancel()
         ruleErrors = [:]
         var assignments: [Int: UUID] = [:]
-        if started && !paused && outputRecordingDepth == 0 && !capturing && accessibilityGranted {
+        if started && !paused && outputRecordingDepth == 0 && !keyboardRecording && !capturing && accessibilityGranted {
             for rule in rules where rule.assignment.enabled {
                 do {
                     try MouseButtonRule.validate(rule, among: rules)
@@ -399,7 +408,7 @@ final class MouseButtonsStore: ObservableObject {
     }
 
     private func perform(_ id: UUID) {
-        guard started, !paused, !capturing, outputRecordingDepth == 0,
+        guard started, !paused, !capturing, outputRecordingDepth == 0, !keyboardRecording,
               let rule = rules.first(where: { $0.id == id && $0.assignment.enabled }) else { return }
         actionError = nil
         runner.run(rule.assignment) { [weak self] error in self?.actionError = error }

@@ -302,3 +302,90 @@ check(captureFailureStore.accessibilityGranted,
       "Stopping the store must invalidate the editor's permission checks")
 
 print("Passed: mouse click pairing, routing, capture, edit/delete during click, queued-action cancellation, pause/disable, permission/retry handling, validation and persistence. No mouse events intercepted or actions posted.")
+
+// Use the same coordination as the app with fake input and action execution.
+let coordinatedSuite = mouseSuite + ".coordinated"
+let coordinatedDefaults = UserDefaults(suiteName: coordinatedSuite)!
+defer { coordinatedDefaults.removePersistentDomain(forName: coordinatedSuite) }
+let coordinatedRegistrar = FakeShortcutRegistrar()
+let coordinatedKeyboardRunner = FakeShortcutRunner()
+let coordinatedKeyboard = KeyboardShortcutsStore(defaults: coordinatedDefaults,
+    registrar: coordinatedRegistrar, runner: coordinatedKeyboardRunner)
+let coordinatedMonitor = FakeMouseMonitor()
+let coordinatedMouseRunner = FakeShortcutRunner()
+coordinatedMouseRunner.accessibilityGranted = true
+let coordinatedMouse = MouseButtonsStore(defaults: coordinatedDefaults,
+    monitor: coordinatedMonitor, runner: coordinatedMouseRunner)
+var coordinatedKeyboardRule = KeyboardShortcutRule()
+coordinatedKeyboardRule.trigger = f6
+coordinatedKeyboardRule.output = cmdC
+try coordinatedKeyboard.save(coordinatedKeyboardRule)
+try coordinatedMouse.save(mouseRule)
+// Coordination must also inherit a recorder that was already started.
+coordinatedKeyboard.setRecording(true)
+Store.coordinateRecording(keyboard: coordinatedKeyboard, mouse: coordinatedMouse)
+coordinatedKeyboard.start()
+coordinatedMouse.start()
+check(!coordinatedMonitor.isRunning && coordinatedMouse.activeCount == 0,
+      "Keyboard recording must suspend mouse assignments when coordination starts")
+coordinatedKeyboard.setRecording(true)
+coordinatedKeyboard.setRecording(false)
+check(!coordinatedMonitor.isRunning && coordinatedRegistrar.registered.isEmpty,
+      "Ending one nested keyboard recorder must not resume either input store")
+check(!coordinatedMonitor.input(3, .down) && !coordinatedMonitor.input(3, .up))
+settleMouseActions()
+check(coordinatedMouseRunner.performed.isEmpty,
+      "Mouse actions must not run while keyboard keys are being recorded")
+coordinatedKeyboard.setRecording(false)
+check(coordinatedMouse.activeCount == 1 && coordinatedRegistrar.registered.count == 1)
+check(coordinatedMonitor.input(3, .down) && coordinatedMonitor.input(3, .up))
+settleMouseActions()
+check(coordinatedMouseRunner.performed.count == 1,
+      "Mouse assignments must resume after the final keyboard recorder ends")
+
+check(coordinatedMonitor.input(3, .down))
+coordinatedKeyboard.setRecording(true)
+check(coordinatedMonitor.isRunning && coordinatedMouse.activeCount == 0,
+      "Recording must keep monitoring until a consumed mouse click is released")
+check(coordinatedMonitor.input(3, .up))
+settleMouseActions()
+check(!coordinatedMonitor.isRunning && coordinatedMouseRunner.performed.count == 1,
+      "The consumed release must drain without firing during keyboard recording")
+coordinatedKeyboard.setRecording(false)
+check(coordinatedMonitor.input(3, .down) && coordinatedMonitor.input(3, .up))
+coordinatedKeyboard.setRecording(true)
+settleMouseActions()
+check(coordinatedMouseRunner.performed.count == 1,
+      "Starting keyboard recording must cancel an already queued mouse action")
+
+coordinatedMouse.setOutputRecording(true)
+coordinatedKeyboard.setRecording(false)
+check(!coordinatedMonitor.isRunning && coordinatedRegistrar.registered.isEmpty,
+      "Mouse output recording must retain suspension after keyboard recording ends")
+coordinatedMouse.setOutputRecording(false)
+check(coordinatedMouse.activeCount == 1 && coordinatedRegistrar.registered.count == 1)
+
+coordinatedKeyboard.setRecording(true)
+coordinatedMouse.setOutputRecording(true)
+coordinatedMouse.stop()
+coordinatedMouse.setOutputRecording(false)
+coordinatedMouse.start()
+coordinatedKeyboard.stop()
+coordinatedKeyboard.start()
+check(!coordinatedMonitor.isRunning && coordinatedRegistrar.registered.isEmpty,
+      "Stopping and restarting must preserve an outstanding keyboard recorder")
+coordinatedKeyboard.setRecording(false)
+check(coordinatedMouse.activeCount == 1 && coordinatedRegistrar.registered.count == 1,
+      "Mouse shutdown must balance only its own recorder without leaking suspension")
+
+coordinatedMouse.setOutputRecording(true)
+coordinatedKeyboard.stop()
+coordinatedMouse.stop()
+coordinatedMouse.start()
+coordinatedKeyboard.start()
+check(coordinatedMouse.activeCount == 1 && coordinatedRegistrar.registered.count == 1,
+      "Application stop order must balance mouse recording before either store restarts")
+coordinatedKeyboard.stop()
+coordinatedMouse.stop()
+
+print("Passed: shared keyboard/mouse recording, nested and mixed recorder lifetimes, click release draining, queued-action cancellation and stop/restart. No input intercepted or actions posted.")

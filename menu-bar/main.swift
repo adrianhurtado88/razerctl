@@ -95,9 +95,14 @@ final class Store: ObservableObject, Identifiable {
         self.beginPrivacyActivity = beginPrivacyActivity
         self.endPrivacyActivity = endPrivacyActivity
         if targetID == nil {
-            let keyboard = shortcuts
-            mouseButtons.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
+            Self.coordinateRecording(keyboard: shortcuts, mouse: mouseButtons)
         }
+    }
+
+    static func coordinateRecording(keyboard: KeyboardShortcutsStore, mouse: MouseButtonsStore) {
+        mouse.onKeyRecordingChanged = { [weak keyboard] recording in keyboard?.setRecording(recording) }
+        keyboard.onRecordingChanged = { [weak mouse] recording in mouse?.setKeyboardRecording(recording) }
+        mouse.setKeyboardRecording(keyboard.isRecording)
     }
 
     /// nil means the panel is not currently checking macOS's secure-input
