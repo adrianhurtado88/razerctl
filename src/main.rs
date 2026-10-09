@@ -4,6 +4,7 @@
 //! settings that actually matter: DPI, polling rate, lighting, scroll wheel.
 
 mod devices;
+mod discovery;
 mod protocol;
 
 use devices::{Handle, Kind, PROFILES};
@@ -15,6 +16,8 @@ razerctl — control your Razer peripherals without Synapse
 
 USAGE:
   razerctl list                          Show detected devices
+  razerctl detect                        Discover devices + capabilities (JSON)
+  razerctl inventory                     Enumerate Razer HID products (no I/O)
   razerctl info                          Firmware + current settings (human)
   razerctl status                        Same, machine-readable key=value
 
@@ -37,6 +40,7 @@ EFFECTS (per device — the hardware refuses the rest):
   keyboard:   spectrum · static <RRGGBB> · breath · breath-single <RRGGBB> · none
 
 OPTIONS:
+  --id <id>                             Target one exact discovered device
   --dev <keyboard|mouse>                 Target one device only
   --led <all|scroll|logo>                Mouse brightness target
 
@@ -74,9 +78,14 @@ fn run(args: &[String]) -> Result<String, String> {
     let mut positional: Vec<&str> = Vec::new();
     let mut led: Option<u8> = None;
     let mut dev_filter: Option<Kind> = None;
+    let mut device_id: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--id" => {
+                i += 1;
+                device_id = Some(args.get(i).ok_or("--id needs a value")?);
+            }
             "--led" => {
                 i += 1;
                 let v = args.get(i).ok_or("--led needs a value")?;
@@ -114,9 +123,20 @@ fn run(args: &[String]) -> Result<String, String> {
 
     match *cmd {
         "list" => cmd_list(&api),
+        "detect" => discovery::detect(&api, true),
+        "inventory" => discovery::detect(&api, false),
         "probe" => Ok(devices::probe_all(&api)),
         _ => {
-            let (handles, failures) = devices::open_all(&api);
+            let (handles, failures) = devices::open_all(&api, device_id, dev_filter);
+            if device_id.is_some() && handles.is_empty() {
+                return Err(failures.first().cloned().unwrap_or_else(|| {
+                    "selected device is unavailable; click Detect to reconnect".into()
+                }));
+            }
+            // Validate every target before any setting is changed.
+            for handle in &handles {
+                validate_command(handle.profile(), cmd, rest)?;
+            }
             for f in &failures {
                 eprintln!("{f}");
             }
@@ -145,16 +165,69 @@ fn run(args: &[String]) -> Result<String, String> {
 fn cmd_list(api: &hidapi::HidApi) -> Result<String, String> {
     let mut out = String::new();
     for p in PROFILES {
-        let found = api
-            .device_list()
-            .any(|d| d.vendor_id() == USB_VENDOR_ID && d.product_id() == p.pid);
+        let found = api.device_list().any(|d| {
+            d.vendor_id() == USB_VENDOR_ID
+                && d.product_id() == p.pid
+                && devices::usb_control_transport(d.bus_type())
+        });
         let status = if found { "connected" } else { "not connected" };
         out.push_str(&format!(
             "{:<22} USB 1532:{:04X}  control iface {}   {}\n",
             p.name, p.pid, p.interface, status
         ));
     }
+    let inventory: serde_json::Value =
+        serde_json::from_str(&discovery::detect(api, false)?).map_err(|e| e.to_string())?;
+    for d in inventory["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["supported"] == false)
+    {
+        out.push_str(&format!(
+            "{}  {} {}  detected (customization not yet supported by USB core)\n",
+            d["name"].as_str().unwrap_or("Razer device"),
+            d["transport"].as_str().unwrap_or("unknown"),
+            d["usb_id"].as_str().unwrap_or("")
+        ));
+    }
     Ok(out.trim_end().to_string())
+}
+
+fn validate_command(p: &devices::Profile, cmd: &str, args: &[&str]) -> Result<(), String> {
+    let supported = match cmd {
+        "effect" => p.supports(parse_effect(args)?),
+        "brightness" => !p.effects.is_empty(),
+        "scroll" => p.scroll,
+        "zones" | "rainbow" => p.zones > 0,
+        "dpi" | "stages" | "poll" => p.is_mouse(),
+        _ => true,
+    };
+    // Mouse-only commands with no selector retain their traditional behavior
+    // of ignoring keyboards; explicit selection never silently succeeds.
+    if !supported
+        && !(p.kind == Kind::Keyboard
+            && matches!(
+                cmd,
+                "dpi" | "stages" | "poll" | "scroll" | "zones" | "rainbow"
+            ))
+    {
+        return Err(format!("{} does not support {cmd}", p.name));
+    }
+    if matches!(cmd, "dpi" | "stages") && p.is_mouse() {
+        let values = args.first().ok_or("DPI value required")?;
+        for value in values.split(',').chain(if cmd == "dpi" {
+            args.get(1).copied()
+        } else {
+            None
+        }) {
+            let dpi: u16 = value.trim().parse().map_err(|_| "DPI must be a number")?;
+            if dpi == 0 || dpi > p.dpi_max {
+                return Err(format!("{}: DPI must be 1-{}", p.name, p.dpi_max));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_info(handles: &[Handle]) -> Result<String, String> {
@@ -166,9 +239,7 @@ fn cmd_info(handles: &[Handle]) -> Result<String, String> {
         let p = h.profile();
         out.push_str(&format!(
             "{}\n  firmware:  v{}.{}\n",
-            p.name,
-            h.firmware.0,
-            h.firmware.1
+            p.name, h.firmware.0, h.firmware.1
         ));
         if p.is_mouse() {
             if let Ok(resp) = h.execute(get_dpi_xy(p.txid)) {
@@ -184,7 +255,11 @@ fn cmd_info(handles: &[Handle]) -> Result<String, String> {
                         let base = 3 + (i as usize) * 7;
                         let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
                         let y = ((resp.arg(base + 3) as u16) << 8) | resp.arg(base + 4) as u16;
-                        Some(if x == y { format!("{x}") } else { format!("{x}x{y}") })
+                        Some(if x == y {
+                            format!("{x}")
+                        } else {
+                            format!("{x}x{y}")
+                        })
                     })
                     .collect();
                 out.push_str(&format!(
@@ -202,9 +277,15 @@ fn cmd_info(handles: &[Handle]) -> Result<String, String> {
                 };
                 out.push_str(&format!("  poll rate: {rate} Hz\n"));
             }
-            if let Ok(resp) = h.execute(get_scroll_mode(p.txid)) {
-                let mode = if resp.arg(1) == 1 { "free spin" } else { "tactile" };
-                out.push_str(&format!("  scroll:    {mode}\n"));
+            if p.scroll {
+                if let Ok(resp) = h.execute(get_scroll_mode(p.txid)) {
+                    let mode = if resp.arg(1) == 1 {
+                        "free spin"
+                    } else {
+                        "tactile"
+                    };
+                    out.push_str(&format!("  scroll:    {mode}\n"));
+                }
             }
         }
     }
@@ -277,7 +358,9 @@ fn cmd_status(handles: &[Handle], failures: &[String]) -> Result<String, String>
                 if let Ok(resp) = h.execute(get_dpi_xy(p.txid)) {
                     let x = ((resp.arg(1) as u16) << 8) | resp.arg(2) as u16;
                     let y = ((resp.arg(3) as u16) << 8) | resp.arg(4) as u16;
-                    out.push_str(&format!("dpi={x}\ndpi_y={y}\n"));
+                    if x > 0 && x <= p.dpi_max && y > 0 && y <= p.dpi_max {
+                        out.push_str(&format!("dpi={x}\ndpi_y={y}\n"));
+                    }
                 }
                 if let Ok(resp) = h.execute(get_dpi_stages(p.txid)) {
                     let active = resp.arg(1);
@@ -285,44 +368,61 @@ fn cmd_status(handles: &[Handle], failures: &[String]) -> Result<String, String>
                     let stages: Vec<String> = (0..count)
                         .filter_map(|i| {
                             let base = 3 + (i as usize) * 7;
-                            let x =
-                                ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
+                            let x = ((resp.arg(base + 1) as u16) << 8) | resp.arg(base + 2) as u16;
                             Some(x.to_string())
                         })
                         .collect();
-                    out.push_str(&format!(
-                        "stages={}\nactive_stage={}\n",
-                        stages.join(","),
-                        active + 1
-                    ));
+                    if (1..=5).contains(&resp.arg(2))
+                        && stages.iter().all(|s| {
+                            s.parse::<u16>()
+                                .is_ok_and(|dpi| dpi > 0 && dpi <= p.dpi_max)
+                        })
+                    {
+                        out.push_str(&format!(
+                            "stages={}\nactive_stage={}\n",
+                            stages.join(","),
+                            active + 1
+                        ));
+                    }
                 }
                 if let Ok(resp) = h.execute(get_poll_rate(p.txid)) {
-                    let rate = match resp.arg(0) {
-                        0x01 => 1000,
-                        0x02 => 500,
-                        0x08 => 125,
-                        other => other as u16,
-                    };
-                    out.push_str(&format!("poll={rate}\n"));
+                    if let Some(rate) = decode_poll_rate(resp.arg(0)) {
+                        out.push_str(&format!("poll={rate}\n"));
+                    }
                 }
-                if let Ok(resp) = h.execute(get_scroll_mode(p.txid)) {
-                    out.push_str(&format!(
-                        "scroll={}\n",
-                        if resp.arg(1) == 1 { "free" } else { "tactile" }
-                    ));
+                if p.scroll {
+                    if let Ok(resp) = h.execute(get_scroll_mode(p.txid)) {
+                        if resp.arg(1) <= 1 {
+                            out.push_str(&format!(
+                                "scroll={}\n",
+                                if resp.arg(1) == 1 { "free" } else { "tactile" }
+                            ));
+                        }
+                    }
                 }
                 // Read brightness via a per-zone LED: the Basilisk V3
                 // refuses `led=all` for READS (only writes accept it), but
                 // accepts per-zone reads. Since every brightness set writes
                 // all zones to the same value, any zone's value is the
                 // effective brightness.
-                if let Ok(resp) = h.execute(get_brightness(p.txid, LED_SCROLL_WHEEL)) {
-                    out.push_str(&format!("mouse_brightness={}\n", resp.arg(2)));
+                if !p.effects.is_empty() {
+                    if let Ok(resp) = h.execute(get_brightness(p.txid, LED_SCROLL_WHEEL)) {
+                        out.push_str(&format!("mouse_brightness={}\n", resp.arg(2)));
+                    }
                 }
             }
         }
     }
     Ok(out.trim_end().to_string())
+}
+
+fn decode_poll_rate(code: u8) -> Option<u16> {
+    match code {
+        0x01 => Some(1000),
+        0x02 => Some(500),
+        0x08 => Some(125),
+        _ => None,
+    }
 }
 
 fn cmd_dpi(handles: &[Handle], args: &[&str]) -> Result<String, String> {
@@ -332,9 +432,7 @@ fn cmd_dpi(handles: &[Handle], args: &[&str]) -> Result<String, String> {
         .parse()
         .map_err(|_| "DPI must be a number".to_string())?;
     let y: u16 = match args.get(1) {
-        Some(v) => v
-            .parse()
-            .map_err(|_| "DPI must be a number".to_string())?,
+        Some(v) => v.parse().map_err(|_| "DPI must be a number".to_string())?,
         None => x,
     };
     let mut out = String::new();
@@ -502,7 +600,17 @@ fn cmd_effect(
             }
         }
         let report = match p.kind {
-            Kind::Keyboard => keyboard_effect(p.txid, LED_BACKLIGHT, effect),
+            Kind::Keyboard => {
+                let effect = match effect {
+                    Effect::Wave(direction) => Effect::Wave(if matches!(p.pid, 0x02A1 | 0x028F) {
+                        direction ^ 3 // Ornata V3 reverses 1/2 direction codes.
+                    } else {
+                        direction - 1
+                    }), // Other extended keyboards use 0/1.
+                    other => other,
+                };
+                keyboard_effect(p.txid, LED_BACKLIGHT, effect)
+            }
             Kind::Mouse => mouse_effect(p.txid, led.unwrap_or(LED_ALL), effect),
         };
         h.execute(report).map_err(|e| format!("{}: {e}", p.name))?;
@@ -523,7 +631,11 @@ fn apply_zones(handles: &[Handle], colors: &[Rgb]) -> Result<String, String> {
     for h in handles.iter().filter(|h| h.profile().is_mouse()) {
         let p = h.profile();
         if colors.len() > 11 {
-            return Err(format!("{}: too many colors ({}), max 11 zones", p.name, colors.len()));
+            return Err(format!(
+                "{}: too many colors ({}), max 11 zones",
+                p.name,
+                colors.len()
+            ));
         }
         if colors.is_empty() {
             return Err("no colors given".into());
@@ -558,10 +670,7 @@ fn cmd_zones(handles: &[Handle], args: &[&str]) -> Result<String, String> {
         .ok_or("usage: razerctl zones <RRGGBB,RRGGBB,...> (2-11 zones)")?;
     let colors: Vec<Rgb> = raw
         .split(',')
-        .map(|s| {
-            Rgb::parse(s)
-                .ok_or_else(|| format!("'{s}' is not a hex color (expected RRGGBB)"))
-        })
+        .map(|s| Rgb::parse(s).ok_or_else(|| format!("'{s}' is not a hex color (expected RRGGBB)")))
         .collect::<Result<_, _>>()?;
     apply_zones(handles, &colors)
 }
@@ -619,3 +728,43 @@ fn cmd_brightness(
     Ok(out.trim_end().to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn profile(pid: u16) -> &'static devices::Profile {
+        PROFILES.iter().find(|p| p.pid == pid).unwrap()
+    }
+
+    #[test]
+    fn commands_respect_model_features() {
+        let viper = profile(0x00A5);
+        for cmd in ["brightness", "scroll", "rainbow", "zones"] {
+            assert!(validate_command(viper, cmd, &[]).is_err());
+        }
+        assert!(validate_command(viper, "effect", &["wave"]).is_err());
+        assert!(validate_command(profile(0x02A2), "effect", &["wave"]).is_err());
+        assert!(validate_command(profile(0x026B), "effect", &["wave"]).is_ok());
+        assert!(validate_command(profile(0x0099), "effect", &["breath"]).is_err());
+        assert!(validate_command(profile(0x0099), "rainbow", &[]).is_ok());
+    }
+
+    #[test]
+    fn dpi_limits_follow_the_model_for_both_axes_and_stages() {
+        assert!(validate_command(profile(0x00A5), "dpi", &["30000"]).is_ok());
+        assert!(validate_command(profile(0x0099), "dpi", &["30000"]).is_err());
+        assert!(validate_command(profile(0x00A5), "dpi", &["1600", "30001"]).is_err());
+        assert!(validate_command(profile(0x00A5), "dpi", &["0"]).is_err());
+        assert!(validate_command(profile(0x00A5), "stages", &["400,30001"]).is_err());
+        assert!(validate_command(profile(0x00B6), "dpi", &["30000"]).is_ok());
+        assert!(validate_command(profile(0x00B6), "dpi", &["35000"]).is_err());
+    }
+
+    #[test]
+    fn unknown_poll_codes_are_not_presented_as_rates() {
+        assert_eq!(decode_poll_rate(1), Some(1000));
+        assert_eq!(decode_poll_rate(2), Some(500));
+        assert_eq!(decode_poll_rate(8), Some(125));
+        assert_eq!(decode_poll_rate(0), None);
+        assert_eq!(decode_poll_rate(3), None);
+    }
+}

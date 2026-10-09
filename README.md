@@ -2,9 +2,9 @@
 
 **A native macOS menu-bar app for Razer lighting, mouse settings and custom shortcuts.**
 
-RazerCtl controls supported peripherals directly over USB, without Synapse or
-an account. The interface uses SwiftUI and AppKit, with a Rust core for device
-commands. Custom assignments are stored locally; the app contacts GitHub to
+RazerCtl controls supported peripherals directly over USB and selected mice
+over Bluetooth, without Synapse or an account. The interface uses SwiftUI
+and AppKit, with a Rust core for device commands. Custom assignments are stored locally; the app contacts GitHub to
 check for and download updates.
 
 <img src="docs/design/lighting-first/preview.png" alt="RazerCtl lighting panel showing keyboard and mouse brightness controls and mouse performance settings" width="360">
@@ -14,18 +14,46 @@ check for and download updates.
 
 ## Supported devices
 
-Device control supports these USB models:
+Previously verified USB devices:
 
 | Device | Hardware notes |
 |---|---|
 | Razer Ornata V3 X | single-zone backlight |
 | Razer Basilisk V3 | 13 independently addressable RGB zones |
 
-Additional keyboards will be added as needed. Models outside this list need
-device-specific support and hardware validation; see
-[Development notes](docs/DEVNOTES.md). Keyboard shortcuts and mouse button
-assignments work across Mac input devices while RazerCtl is running, independently
-of these USB control profiles.
+RazerCtl now detects connected Razer HID products automatically at launch
+and when devices are attached or removed. **Detect** in the panel header
+retries discovery without restarting the app. Discovery reads settings; it
+does not change lighting, DPI, or other device settings.
+
+The feature catalog contains 14 USB product variants across the Ornata V3,
+Ornata V3 X, Ornata V3 TKL, Huntsman V2, Huntsman V2 TKL, Basilisk V3,
+Viper V2 Pro, and DeathAdder V3 Pro families. The additional profiles are
+based on upstream protocol documentation and still need physical-device
+verification. Viper V2 Pro and DeathAdder V3 Pro expose DPI and polling
+controls, without lighting or motorized-wheel controls.
+
+Controls follow the model's supported commands and successful setting
+read-backs. Unrecognized models remain visible with their connection type and an
+unsupported-model message. **Detection does not imply universal Razer
+customization support**; unknown devices need a verified profile before
+configuration commands are enabled.
+
+**Initial Bluetooth support:** the menu-bar app includes a separate native
+Bluetooth controller for Basilisk V3 X HyperSpeed and Basilisk V3 Pro. It
+implements DPI selection/custom values, brightness and static color, gated
+by successful reads, using the documented OpenSnek Bluetooth protocol.
+These new paths are covered by automated checks but still need physical-device
+verification in RazerCtl. Pair the mouse in macOS Bluetooth settings first,
+allow RazerCtl Bluetooth access, and click **Detect**. Other Razer Bluetooth
+HID products remain visible without customization controls; Bluetooth keyboard
+customization is not implemented. Polling-rate and wheel controls are not
+offered over Bluetooth. The Rust CLI remains a USB controller.
+
+See [Device detection](docs/DEVICE-DETECTION.md) for connection details and limits.
+
+Keyboard shortcuts and mouse button assignments work across Mac input devices
+while RazerCtl is running, independently of the device control profiles.
 
 ## Features
 
@@ -45,6 +73,8 @@ of these USB control profiles.
 
 **The app**
 
+- Automatic device discovery plus a manual Detect button
+- Model-specific controls and independent settings for multiple keyboards or mice
 - Native SwiftUI panel with per-device sections
 - Product photos for known models, with stock device symbols when artwork is unavailable
 - Custom keyboard shortcuts: send another shortcut, open an app, or open a website
@@ -101,6 +131,7 @@ In **System Settings → Privacy & Security**, enable RazerCtl for the features 
 use:
 
 - **Input Monitoring:** keyboard lighting and brightness controls.
+- **Bluetooth:** detection and supported controls for paired Bluetooth devices.
 - **Accessibility:** custom mouse button assignments and sending keyboard
   shortcuts. The editors provide **Allow Accessibility…** controls; the mouse
   editor also has **Retry**.
@@ -190,7 +221,9 @@ razerctl list
 After building from source, you can also use `./target/release/razerctl` directly.
 
 ```text
-razerctl list                          detected supported devices
+razerctl list                          connected and catalogued devices
+razerctl inventory                     Razer HID inventory as JSON (no device I/O)
+razerctl detect                        devices, features, settings and errors as JSON
 razerctl info                          firmware + current settings (human)
 razerctl status                        same, machine-readable key=value
 
@@ -204,6 +237,10 @@ razerctl brightness <0-100>            set lighting brightness
 razerctl zones <c1,c2,...>             per-zone static colors (mouse)
 razerctl rainbow [n]                   static rainbow over n zones (mouse)
 ```
+
+Use `--id <id>` with an ID from `detect` to target one exact USB device when
+several keyboards or mice are connected. The menu-bar app uses these selectors
+for USB commands and native Bluetooth UUIDs for Bluetooth commands.
 
 Supported per-device effects:
 

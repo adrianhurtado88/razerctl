@@ -19,7 +19,8 @@ Path(os.environ['WIDGET_TEST_DIR'], 'main.swift').write_text(
     source + '\n' + Path('tests/widget-regression.swift').read_text()
     + '\n' + Path('tests/shortcuts-regression.swift').read_text()
     + '\n' + Path('tests/mouse-buttons-regression.swift').read_text()
+    + '\n' + Path('tests/bluetooth-regression.swift').read_text()
 )
 PY
-swiftc -O -o "$WIDGET_TEST_DIR/widget-check" "$WIDGET_TEST_DIR/main.swift"
+swiftc -O -o "$WIDGET_TEST_DIR/widget-check" "$WIDGET_TEST_DIR/main.swift" menu-bar/Bluetooth.swift
 "$WIDGET_TEST_DIR/widget-check"

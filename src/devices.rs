@@ -4,12 +4,14 @@ use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
-use hidapi::{HidApi, HidDevice};
+use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
+use serde::Serialize;
 
 use crate::protocol::*;
 
 /// What kind of device this is (drives which commands apply).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Keyboard,
     Mouse,
@@ -34,11 +36,100 @@ pub struct Profile {
     pub kind: Kind,
     /// Maximum DPI (mice).
     pub dpi_max: u16,
+    pub effects: &'static [&'static str],
+    pub scroll: bool,
+    pub zones: usize,
+    /// Some USB receivers need 31 ms between request and response.
+    pub response_wait_ms: u64,
 }
 
 impl Profile {
     pub fn is_mouse(&self) -> bool {
         self.kind == Kind::Mouse
+    }
+
+    pub fn matches(&self, info: &DeviceInfo) -> bool {
+        usb_control_transport(info.bus_type())
+            && self.matches_collection(
+                info.vendor_id(),
+                info.product_id(),
+                info.interface_number(),
+                info.usage_page(),
+                info.usage(),
+            )
+    }
+
+    fn matches_collection(
+        &self,
+        vendor: u16,
+        pid: u16,
+        interface: i32,
+        page: u16,
+        usage: u16,
+    ) -> bool {
+        vendor == USB_VENDOR_ID
+            && pid == self.pid
+            && interface == self.interface
+            && page == self.usage_page
+            && usage == self.usage
+    }
+
+    pub fn supports(&self, effect: Effect) -> bool {
+        let name = match effect {
+            Effect::None => "none",
+            Effect::Static(_) => "static",
+            Effect::Spectrum => "spectrum",
+            Effect::Wave(_) => "wave",
+            Effect::BreathRandom | Effect::BreathSingle(_) => "breath",
+        };
+        self.effects.contains(&name)
+    }
+}
+
+/// These profiles describe USB control collections, not Bluetooth reports.
+pub fn usb_control_transport(bus: BusType) -> bool {
+    matches!(bus, BusType::Usb)
+}
+
+const KEYBOARD_EFFECTS: &[&str] = &["spectrum", "breath", "static", "none"];
+const MATRIX_EFFECTS: &[&str] = &["spectrum", "wave", "breath", "static", "none"];
+
+const fn keyboard(
+    pid: u16,
+    name: &'static str,
+    interface: i32,
+    effects: &'static [&'static str],
+) -> Profile {
+    Profile {
+        pid,
+        name,
+        interface,
+        usage_page: if interface == 2 { 1 } else { 12 },
+        usage: if interface == 2 { 2 } else { 1 },
+        txid: 0x1F,
+        kind: Kind::Keyboard,
+        dpi_max: 0,
+        effects,
+        scroll: false,
+        zones: 0,
+        response_wait_ms: 1,
+    }
+}
+
+const fn performance_mouse(pid: u16, name: &'static str, dpi_max: u16) -> Profile {
+    Profile {
+        pid,
+        name,
+        interface: 0,
+        usage_page: 1,
+        usage: 2,
+        txid: 0x1F,
+        kind: Kind::Mouse,
+        dpi_max,
+        effects: &[],
+        scroll: false,
+        zones: 0,
+        response_wait_ms: 31,
     }
 }
 
@@ -49,16 +140,13 @@ impl Profile {
 /// Everything else on the device is an input interface — those must never be
 /// written to, or the firmware resets itself (the user feels a "drop").
 pub const PROFILES: &[Profile] = &[
-    Profile {
-        pid: 0x02A2,
-        name: "Razer Ornata V3 X",
-        interface: 2,
-        usage_page: 0x0001,
-        usage: 0x0002,
-        txid: 0x1F,
-        kind: Kind::Keyboard,
-        dpi_max: 0,
-    },
+    keyboard(0x02A2, "Razer Ornata V3 X", 2, KEYBOARD_EFFECTS),
+    keyboard(0x0294, "Razer Ornata V3 X", 2, KEYBOARD_EFFECTS),
+    keyboard(0x02A1, "Razer Ornata V3", 2, MATRIX_EFFECTS),
+    keyboard(0x028F, "Razer Ornata V3", 2, MATRIX_EFFECTS),
+    keyboard(0x02A3, "Razer Ornata V3 TKL", 2, MATRIX_EFFECTS),
+    keyboard(0x026B, "Razer Huntsman V2 TKL", 3, MATRIX_EFFECTS),
+    keyboard(0x026C, "Razer Huntsman V2", 3, MATRIX_EFFECTS),
     Profile {
         pid: 0x0099,
         name: "Razer Basilisk V3",
@@ -68,9 +156,21 @@ pub const PROFILES: &[Profile] = &[
         txid: 0x1F,
         kind: Kind::Mouse,
         dpi_max: 26000,
+        effects: &["spectrum", "wave", "rainbow", "static", "none"],
+        scroll: true,
+        zones: 11,
+        response_wait_ms: 1,
     },
+    // No lighting or motorized wheel on these models. Only the common
+    // DPI/stage and 125/500/1000 Hz protocol is enabled.
+    performance_mouse(0x00A5, "Razer Viper V2 Pro (Wired)", 30000),
+    performance_mouse(0x00A6, "Razer Viper V2 Pro (Wireless)", 30000),
+    // Use Razer's published 30K limit rather than upstream's 35K value.
+    performance_mouse(0x00B6, "Razer DeathAdder V3 Pro (Wired)", 30000),
+    performance_mouse(0x00B7, "Razer DeathAdder V3 Pro (Wireless)", 30000),
+    performance_mouse(0x00C2, "Razer DeathAdder V3 Pro (Wired)", 30000),
+    performance_mouse(0x00C3, "Razer DeathAdder V3 Pro (Wireless)", 30000),
 ];
-
 
 #[derive(Debug)]
 pub struct RazerError(pub String);
@@ -93,6 +193,19 @@ pub struct Handle {
     profile: &'static Profile,
     /// Firmware version, read while probing.
     pub firmware: (u8, u8),
+    pub id: String,
+}
+
+/// Opaque, exact control-path selector. Never select a different device if
+/// a previously discovered path disappears.
+pub fn device_id(info: &DeviceInfo) -> String {
+    let path: String = info
+        .path()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{:04x}:{path}", info.product_id())
 }
 
 impl Handle {
@@ -107,33 +220,14 @@ impl Handle {
     /// there makes the firmware reset (the peripheral visibly drops), so we
     /// only ever open the exact (interface, usage page, usage) triple from
     /// the device profile.
-    pub fn open(api: &HidApi, profile: &'static Profile) -> Result<Handle, RazerError> {
-        let present = api
-            .device_list()
-            .any(|d| d.vendor_id() == USB_VENDOR_ID && d.product_id() == profile.pid);
-        if !present {
-            return err(format!(
-                "{} (USB {:04X}:{:04X}) not found — is it plugged in?",
-                profile.name, USB_VENDOR_ID, profile.pid
-            ));
+    pub fn open(
+        api: &HidApi,
+        profile: &'static Profile,
+        info: &DeviceInfo,
+    ) -> Result<Handle, RazerError> {
+        if !profile.matches(info) {
+            return err("refusing to open an unrecognized control collection");
         }
-
-        let control = api.device_list().find(|d| {
-            d.vendor_id() == USB_VENDOR_ID
-                && d.product_id() == profile.pid
-                && d.interface_number() == profile.interface
-                && d.usage_page() == profile.usage_page
-                && d.usage() == profile.usage
-        });
-        let info = match control {
-            Some(i) => i,
-            None => {
-                return err(format!(
-                    "{} is connected but its control collection is not available",
-                    profile.name
-                ))
-            }
-        };
 
         let dev = api
             .open_path(info.path())
@@ -142,12 +236,14 @@ impl Handle {
             device: dev,
             profile,
             firmware: (0, 0),
+            id: device_id(info),
         };
         match handle.execute(get_firmware(profile.txid)) {
             Ok(resp) => Ok(Handle {
                 device: handle.device,
                 profile,
                 firmware: (resp.arg(0), resp.arg(1)),
+                id: handle.id,
             }),
             Err(e) => err(format!("{}: {}", profile.name, e.0)),
         }
@@ -176,7 +272,7 @@ impl Handle {
         let mut last = String::from("no response");
         for _attempt in 0..5 {
             self.send(report)?;
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(self.profile.response_wait_ms));
 
             let mut buf = [0u8; REPORT_LEN + 1]; // exact size matters
             buf[0] = 0;
@@ -200,10 +296,7 @@ impl Handle {
                 continue;
             };
             if debug {
-                let head: Vec<String> = content[..16]
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect();
+                let head: Vec<String> = content[..16].iter().map(|b| format!("{b:02X}")).collect();
                 eprintln!("[debug] response: {}", head.join(" "));
             }
             let mut resp = Report {
@@ -245,24 +338,51 @@ impl Handle {
 /// line per device that was present but refused communication, formatted
 /// `keyboard_error=...` / `mouse_error=...` so `status` can surface the
 /// reason to the widget UI.
-pub fn open_all(api: &HidApi) -> (Vec<Handle>, Vec<String>) {
+pub fn open_all(api: &HidApi, id: Option<&str>, kind: Option<Kind>) -> (Vec<Handle>, Vec<String>) {
     let mut handles = Vec::new();
     let mut failures = Vec::new();
     for profile in PROFILES {
-        let present = api
-            .device_list()
-            .any(|d| d.vendor_id() == USB_VENDOR_ID && d.product_id() == profile.pid);
+        if kind.is_some_and(|k| k != profile.kind) {
+            continue;
+        }
+        let present = api.device_list().any(|d| {
+            d.vendor_id() == USB_VENDOR_ID
+                && d.product_id() == profile.pid
+                && usb_control_transport(d.bus_type())
+        });
         if !present {
             continue;
         }
-        match Handle::open(api, profile) {
-            Ok(h) => handles.push(h),
-            Err(e) => {
-                let key = match profile.kind {
-                    Kind::Keyboard => "keyboard_error",
-                    Kind::Mouse => "mouse_error",
-                };
-                failures.push(format!("{key}={}", e.0));
+        let controls: Vec<_> = api
+            .device_list()
+            .filter(|d| profile.matches(d))
+            .filter(|d| id.is_none_or(|id| device_id(d) == id))
+            .collect();
+        if controls.is_empty() && id.is_none() {
+            failures.push(format!(
+                "{}_error={}: control collection is not available",
+                if profile.is_mouse() {
+                    "mouse"
+                } else {
+                    "keyboard"
+                },
+                profile.name
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for info in controls {
+            if !seen.insert(device_id(info)) {
+                continue;
+            }
+            match Handle::open(api, profile, info) {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    let key = match profile.kind {
+                        Kind::Keyboard => "keyboard_error",
+                        Kind::Mouse => "mouse_error",
+                    };
+                    failures.push(format!("{key}={}", e.0));
+                }
             }
         }
     }
@@ -280,25 +400,16 @@ pub fn open_all(api: &HidApi) -> (Vec<Handle>, Vec<String>) {
 pub fn probe_all(api: &HidApi) -> String {
     let mut out = String::new();
     for profile in PROFILES {
-        out.push_str(&format!("== {} (1532:{:04X}) ==\n", profile.name, profile.pid));
+        out.push_str(&format!(
+            "== {} (1532:{:04X}) ==\n",
+            profile.name, profile.pid
+        ));
         for info in api
             .device_list()
             .filter(|d| d.vendor_id() == USB_VENDOR_ID && d.product_id() == profile.pid)
         {
             // Whitelist: control collections only.
-            let is_control = match profile.pid {
-                0x02A2 => {
-                    info.interface_number() == 2
-                        && info.usage_page() == 0x0001
-                        && info.usage() == 0x0002
-                }
-                0x0099 => {
-                    info.interface_number() == 3
-                        && info.usage_page() == 0x000C
-                        && info.usage() == 0x0001
-                }
-                _ => false,
-            };
+            let is_control = profile.matches(info);
             if !is_control {
                 continue;
             }
@@ -326,7 +437,10 @@ pub fn probe_all(api: &HidApi) -> String {
                         .iter()
                         .map(|b| format!("{b:02X}"))
                         .collect();
-                    out.push_str(&format!("    quiescent rid 0: GET {n} bytes: {}\n", hex.join(" ")));
+                    out.push_str(&format!(
+                        "    quiescent rid 0: GET {n} bytes: {}\n",
+                        hex.join(" ")
+                    ));
                 }
                 Err(e) => out.push_str(&format!("    quiescent rid 0: GET failed: {e}\n")),
             }
@@ -403,4 +517,42 @@ pub fn probe_all(api: &HidApi) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_exact_catalogued_control_collections_match() {
+        assert!(usb_control_transport(BusType::Usb));
+        assert!(!usb_control_transport(BusType::Bluetooth));
+        assert!(!usb_control_transport(BusType::Unknown));
+        for p in PROFILES {
+            assert!(p.matches_collection(USB_VENDOR_ID, p.pid, p.interface, p.usage_page, p.usage));
+            assert!(!p.matches_collection(
+                USB_VENDOR_ID,
+                p.pid,
+                p.interface + 1,
+                p.usage_page,
+                p.usage
+            ));
+            assert!(!p.matches_collection(USB_VENDOR_ID, p.pid, p.interface, 0xFF00, p.usage));
+            assert!(!p.matches_collection(USB_VENDOR_ID, p.pid, p.interface, p.usage_page, 6));
+            assert!(!p.matches_collection(0x1234, p.pid, p.interface, p.usage_page, p.usage));
+            assert!(!p.matches_collection(
+                USB_VENDOR_ID,
+                0xFFFF,
+                p.interface,
+                p.usage_page,
+                p.usage
+            ));
+        }
+        let ids: std::collections::HashSet<_> = PROFILES.iter().map(|p| p.pid).collect();
+        assert_eq!(
+            ids.len(),
+            PROFILES.len(),
+            "Profiles must have unique product IDs"
+        );
+    }
 }
