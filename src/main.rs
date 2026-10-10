@@ -5,6 +5,7 @@
 
 mod devices;
 mod discovery;
+mod keyboard;
 mod protocol;
 
 use devices::{Handle, Kind, PROFILES};
@@ -20,6 +21,7 @@ USAGE:
   razerctl inventory                     Enumerate Razer HID products (no I/O)
   razerctl info                          Firmware + current settings (human)
   razerctl status                        Same, machine-readable key=value
+  razerctl keyboard-mode <macro|gaming> [<on|off> <expected-on|expected-off>] --id <id>
 
   razerctl dpi <x> [<y>]                  Set mouse DPI (defaults y = x)
   razerctl stages <v1,v2,...> [active]   Set onboard DPI stages (2-5 values),
@@ -143,6 +145,7 @@ fn run(args: &[String]) -> Result<String, String> {
             match *cmd {
                 "info" => cmd_info(&handles),
                 "status" => cmd_status(&handles, &failures),
+                "keyboard-mode" => keyboard::command(&handles, rest, device_id.is_some()),
                 "brightread" => cmd_brightread(&handles),
                 "dpi" => cmd_dpi(&handles, rest),
                 "stages" => cmd_stages(&handles, rest),
@@ -195,6 +198,14 @@ fn cmd_list(api: &hidapi::HidApi) -> Result<String, String> {
 }
 
 fn validate_command(p: &devices::Profile, cmd: &str, args: &[&str]) -> Result<(), String> {
+    if cmd == "keyboard-mode" {
+        keyboard::parse(args)?;
+        return if keyboard::supported(p) {
+            Ok(())
+        } else {
+            Err(format!("{} does not support keyboard modes", p.name))
+        };
+    }
     let supported = match cmd {
         "effect" => p.supports(parse_effect(args)?),
         "brightness" => !p.effects.is_empty(),
@@ -381,6 +392,16 @@ fn cmd_status(handles: &[Handle], failures: &[String]) -> Result<String, String>
                 ));
                 if let Ok(resp) = h.execute(get_brightness(p.txid, LED_BACKLIGHT)) {
                     out.push_str(&format!("kbd_brightness={}\n", resp.arg(2)));
+                }
+                if keyboard::supported(p) {
+                    for (led, key) in [
+                        (keyboard::MACRO, "macro_recording"),
+                        (keyboard::GAMING, "gaming_mode"),
+                    ] {
+                        if let Ok(value) = keyboard::read(h, led) {
+                            out.push_str(&format!("{key}={}\n", value as u8));
+                        }
+                    }
                 }
             }
             Kind::Mouse => {

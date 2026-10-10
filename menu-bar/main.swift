@@ -10,6 +10,7 @@
 import SwiftUI
 import AppKit
 import Carbon
+import Combine
 
 // MARK: - Store
 
@@ -22,6 +23,8 @@ struct DeviceCapabilities: Decodable {
     var poll_rates: [Int] = []
     var scroll = false
     var zones = 0
+    var gaming_mode: Bool? = nil
+    var macro_indicator: Bool? = nil
 
     var hasPerformance: Bool { dpi_max > 0 || !poll_rates.isEmpty || scroll }
     var lightingEffects: [(String, String)] {
@@ -56,6 +59,33 @@ final class Store: ObservableObject, Identifiable {
     // Secure input belongs to the app, not to any detected keyboard.
     // Observe the root directly so every section displays the same session.
     var keyboardPrivacyStore: Store { discoveryStore?.keyboardPrivacyStore ?? self }
+    private var controlsStore: KeyboardControlsStore?
+    private var controlsExpansionSubscription: AnyCancellable?
+    @Published private(set) var keyboardControlsExpanded = false
+    var keyboardControls: KeyboardControlsStore {
+        if let controlsStore { return controlsStore }
+        let controls = KeyboardControlsStore(id: id, execute: { [weak self] args, completion in
+            guard let self, let targetID = self.targetID else {
+                completion(.failure(ShortcutFailure("Selected keyboard is unavailable. Click Detect to retry."))); return
+            }
+            self.commandQueue.async {
+                let result = self.runResult(args + ["--id", targetID])
+                DispatchQueue.main.async {
+                    if result.exitCode == 0 { completion(.success(Self.parseStatus(result.output))) }
+                    else { completion(.failure(ShortcutFailure(result.output.trimmingCharacters(in: .whitespacesAndNewlines)))) }
+                }
+            }
+        }, readLocks: readKeyboardLocks)
+        controls.apply(settings: status, gamingAvailable: capabilities.gaming_mode == true, macroAvailable: capabilities.macro_indicator == true)
+        controlsStore = controls
+        controlsExpansionSubscription = controls.$expanded.sink { [weak self] expanded in
+            guard let self, self.keyboardControlsExpanded != expanded else { return }
+            self.keyboardControlsExpanded = expanded
+            self.discoveryStore?.objectWillChange.send()
+        }
+        return controls
+    }
+    private var macrosWindow: KeyboardShortcutsWindow?
     private var shortcutsWindow: KeyboardShortcutsWindow?
     private var mouseButtonsWindow: MouseButtonsWindow?
 
@@ -76,8 +106,10 @@ final class Store: ObservableObject, Identifiable {
     private var inventoryChecking = false
     private var scanPending = false
     private let bluetooth: BluetoothBackend?
+    private let readKeyboardLocks: (String) -> [Int: Bool]
 
     init(targetID: String? = nil, commandQueue: DispatchQueue? = nil, bluetooth: BluetoothBackend? = nil,
+         readKeyboardLocks: @escaping (String) -> [Int: Bool] = KeyboardLockReader.read,
          secureInputStatus: @escaping () -> Bool = { IsSecureEventInputEnabled() },
          enableSecureInput: @escaping () -> OSStatus = { EnableSecureEventInput() },
          disableSecureInput: @escaping () -> OSStatus = { DisableSecureEventInput() },
@@ -88,6 +120,7 @@ final class Store: ObservableObject, Identifiable {
          endPrivacyActivity: @escaping (NSObjectProtocol) -> Void = { ProcessInfo.processInfo.endActivity($0) }) {
         self.targetID = targetID
         self.bluetooth = bluetooth
+        self.readKeyboardLocks = readKeyboardLocks
         self.commandQueue = commandQueue ?? DispatchQueue(label: "local.razerctl.widget.commands", qos: .userInitiated)
         self.secureInputStatus = secureInputStatus
         self.enableSecureInput = enableSecureInput
@@ -238,8 +271,32 @@ final class Store: ObservableObject, Identifiable {
         }
     }
 
+    func showKeyboardMacros() {
+        keyboardControls.cancelRecorder?()
+        macrosWindow?.close()
+        macrosWindow = KeyboardShortcutsWindow(store: shortcuts, indicators: keyboardControls, createMacro: true)
+        shortcuts.refreshAccess()
+        macrosWindow?.show()
+    }
+
+    func monitorKeyboardControls(_ visible: Bool) {
+        for device in deviceStores { device.controlsStore?.monitor(visible && device.keyboardControlsExpanded) }
+    }
+
+    func shutdownKeyboardControls(completion: @escaping () -> Void = {}) {
+        shortcuts.cancelActions()
+        let controls = deviceStores.compactMap(\.controlsStore) + (controlsStore.map { [$0] } ?? [])
+        guard !controls.isEmpty else { completion(); return }
+        var remaining = controls.count
+        controls.forEach { $0.shutdown { remaining -= 1; if remaining == 0 { completion() } } }
+    }
+
     func showKeyboardShortcuts() {
-        if let discoveryStore { discoveryStore.showKeyboardShortcuts(); return }
+        if targetID != nil {
+            shortcutsWindow?.close()
+            shortcutsWindow = KeyboardShortcutsWindow(store: shortcuts, indicators: keyboardControls)
+            shortcuts.refreshAccess(); shortcutsWindow?.show(); return
+        }
         if shortcutsWindow == nil { shortcutsWindow = KeyboardShortcutsWindow(store: shortcuts) }
         shortcuts.refreshAccess()
         shortcutsWindow?.show()
@@ -529,9 +586,10 @@ final class Store: ObservableObject, Identifiable {
                     let newIDs = Set(devices.map(\.id))
                     for store in self.deviceStores where !newIDs.contains(store.id) {
                         store.colorDebounces.values.forEach { $0.cancel() }
+                        store.controlsStore?.shutdown()
                     }
                     self.deviceStores = devices.map { device in
-                        let store = previous[device.id] ?? Store(targetID: device.id, commandQueue: self.commandQueue, bluetooth: self.bluetooth)
+                        let store = previous[device.id] ?? Store(targetID: device.id, commandQueue: self.commandQueue, bluetooth: self.bluetooth, readKeyboardLocks: self.readKeyboardLocks)
                         store.discoveryStore = self
                         store.detectedDevice = device
                         var status = device.settings
@@ -540,6 +598,8 @@ final class Store: ObservableObject, Identifiable {
                                 ? error : "\(device.name): \(error)"
                         }
                         store.status = status
+                        store.controlsStore?.apply(settings: status, gamingAvailable: device.capabilities.gaming_mode == true,
+                                                   macroAvailable: device.capabilities.macro_indicator == true)
                         if let value = Double(status["kbd_brightness"] ?? "") {
                             store.kbdBrightness = min(100, max(0, value / 2.55))
                         }
@@ -739,7 +799,7 @@ struct ContentView: View {
             }
             if store.deviceStores.isEmpty {
                 EmptyDevices()
-            } else if store.deviceStores.count > 2 {
+            } else if store.deviceStores.count > 2 || (store.deviceStores.count > 1 && store.deviceStores.contains(where: \.keyboardControlsExpanded)) {
                 ScrollView { deviceList }.frame(height: 550)
             } else {
                 deviceList
@@ -1337,7 +1397,8 @@ private struct KeyboardGroup: View {
                          kind: "Keyboard · \(store.detectedDevice?.connectionLabel ?? "USB")", firmware: store.status["keyboard_fw"])
             if store.status["keyboard"] != nil {
                 LightingControls(device: "keyboard", effects: store.capabilities.lightingEffects)
-                KeyboardShortcutsButton(shortcuts: store.shortcuts, openEditor: store.showKeyboardShortcuts)
+                KeyboardControlsSection(controls: store.keyboardControls, shortcuts: store.shortcuts,
+                                        openShortcuts: store.showKeyboardShortcuts, openMacros: store.showKeyboardMacros)
             } else if let error = store.status["keyboard_error"] {
                 DeviceProblem(error: error)
             }
@@ -1691,6 +1752,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             privacyCleanupObservers.append(workspaceNotifications.addObserver(
                 forName: name, object: nil, queue: .main) { [weak self] _ in
                     self?.store.setTemporaryKeyboardPrivacyEnabled(false)
+                    self?.store.shutdownKeyboardControls { [weak self] in
+                        if name == NSWorkspace.didWakeNotification {
+                            self?.store.refresh()
+                            self?.store.monitorKeyboardControls(self?.popover.isShown == true)
+                        }
+                    }
                 })
         }
 
@@ -1708,6 +1775,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        store.shutdownKeyboardControls { DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) } }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         store.setTemporaryKeyboardPrivacyEnabled(false)
         store.stopKeyboardPrivacyMonitoring()
@@ -1721,10 +1793,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverWillShow(_ notification: Notification) {
         store.startKeyboardPrivacyMonitoring()
+        store.monitorKeyboardControls(true)
     }
 
     func popoverDidClose(_ notification: Notification) {
         store.stopKeyboardPrivacyMonitoring()
+        store.monitorKeyboardControls(false)
     }
 
     /// Show the popover (used by the post-update confirmation).

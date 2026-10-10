@@ -1,45 +1,49 @@
-# Lighting-first widget design QA
+# Collapsible keyboard controls: Design QA
 
-Date: 2026-10-08.
+**Final result: passed** for offscreen native views. Physical lamp behavior,
+real input playback, permissions and the live menu-bar popover remain user checks.
 
-final result: passed
+## Evidence and normalization
 
-This result covers rendered native views and isolated control checks. Physical device behavior and the running menu-bar popover still require a user check. The installed app was not replaced during validation.
+- Source visual truth: [approved option 1 with disclosure](docs/design/keyboard-indicators/approved-design.png), 972 × 1619 pixels.
+- Implementation: [expanded](docs/design/keyboard-indicators/expanded.png), 360 × 639 points/pixels; [collapsed](docs/design/keyboard-indicators/collapsed.png), 360 × 381.
+- [Full comparison](docs/design/keyboard-indicators/comparison-final.png) and [focused comparison](docs/design/keyboard-indicators/controls-comparison.png) place the actual source and production render together in one image.
+- The source is downsampled to 360 × 600 for a 360-point panel comparison (the 0.4-pixel rounding difference is immaterial). Native captures are 1×; focused crops preserve that scale. No CSS viewport applies to these SwiftUI/AppKit views.
+- State: Static lighting, brightness 100%, inactive fixture lock/mode values, controls expanded. The default state is collapsed; privacy stays outside it.
+- The production views were rendered without launching the application bootstrap, displaying windows, capturing global input or posting keys. Fixture values are not hardware observations. Popover chrome/shadow in the reference is excluded from fidelity requirements.
 
-## Target and evidence
+## Findings and fixes
 
-- Source visual truth: [approved design](docs/design/lighting-first/approved-design.png), the selected third design.
-- Rendered implementation: [native preview](docs/design/lighting-first/preview.png), [full comparison](docs/design/lighting-first/comparison-final.png), and [focused controls comparison](docs/design/lighting-first/controls-comparison.png).
-- Source image: 1098 × 1433 pixels. Panel crop: (31, 50)–(1066, 1394), 1035 × 1344 pixels, normalized to 360 × 467 logical pixels.
-- Implementation viewport: 360 × 470 collapsed; 360 × 616 expanded. Native offscreen backing was 1x; cache export was 720 × 940 for the collapsed view. Normalize exports to logical dimensions when comparing. These are not physical Retina screenshots.
-- The production SwiftUI/AppKit views were rendered offscreen without launching the app bootstrap or accessing hardware. The source's outer rounded panel, arrow and shadow belong to NSPopover and are excluded from the content comparison.
-- Matching fixture: both devices, Static lighting, pink/cyan colors, 100% brightness, 1800 DPI, 500 Hz, tactile scroll, collapsed performance, and an available update. Runtime values are not forced to match this fixture; no lighting command runs at launch.
+1. [First comparison](docs/design/keyboard-indicators/comparison-v1.png): blocked. [P2] status markers used rectangles rather than the source's circular markers; [P2] missing row separators weakened grouping; [P2] the macro description sat in an extra row; [P2] the shortcut label differed and looked disabled. Fixed with circular outlines, separators, a two-column macro row, the approved label and primary foreground.
+2. Offscreen macro-editor inspection: blocked. [P2] the new recording instructions pushed Save against the scroll viewport edge at 550 points. The editor now opens at 700 × 620, with a 600-point minimum height. [Revised editor](docs/design/keyboard-indicators/macro-editor.png) shows the form and Save/Cancel controls.
+3. Two-device inspection: blocked. [P2] an expanded keyboard plus mouse reached 924 points. Expansion now notifies the parent panel, which bounds the device list to a scroll area while retaining the header/footer. [Revised two-device view](docs/design/keyboard-indicators/two-devices-expanded.png) is 360 × 660; its regression asserts a height at most 700.
+4. Final full/focused comparisons: passed. The new section preserves the approved order, circular status markers, mode switch, macro action and shortcut link. No actionable P0/P1/P2 issue remains in the rendered states.
 
-## Comparison history and fixes
+## Fidelity surfaces
 
-1. [First comparison](docs/design/lighting-first/comparison-v1.png): blocked. [P1] macOS ignored SwiftUI slider tint and added percentage tick marks. [P2] color wells stretched into pills. [P2] panel height was 510. Fixed with a tinted native slider cell, compact native color wells, and tighter section spacing.
-2. [Second comparison](docs/design/lighting-first/comparison-v2.png): blocked. [P2] native menus centered their disclosure glyphs and the panel was still 504 high. Fixed with a native popup-button cell and reduced spacing.
-3. [Final full comparison](docs/design/lighting-first/comparison-final.png) and [focused comparison](docs/design/lighting-first/controls-comparison.png): passed. The 360 × 470 panel preserves both device headers, aligned lighting controls, full-width brightness rails, a collapsed performance summary, and the update footer. No actionable P0/P1/P2 mismatch remains in the rendered comparison.
-4. Expanded inspection found [P2] polling segments beyond the right inset and a centered scroll row. Fixed with the small native segmented-control size and a label-left/switch-right row. [Revised expanded view](docs/design/lighting-first/expanded.png): all controls fit at 360 × 616.
-5. Single-keyboard inspection found a doubled divider. Fixed by rendering the inter-device divider only when both devices appear. [Revised keyboard-only view](docs/design/lighting-first/keyboard.png): 360 × 260.
+- **Fonts and typography:** native SF system type, 13-point control headings and 11-point captions, consistent with the existing panel. Labels and descriptions are legible; wrapped unavailable/error messages have sufficient height. The generated reference's larger type and switch proportions are treated as native-control translation, rather than requiring a different typography system.
+- **Spacing and layout:** existing 18-point outer insets, lighting above a compact disclosure, separated rows and privacy outside. The single-device and bounded two-device states fit. The macro editor retains its assignment list and form layout.
+- **Colors and tokens:** the existing charcoal surface, white headings, secondary labels and pink keyboard accent remain. Off-state markers are dim; errors use orange. The source's background gradient/outer chrome is an acceptable difference from the existing flat native panel.
+- **Image quality and assets:** keyboard and controller glyphs are native SF Symbols; no new raster UI artwork is required. The approved reference is retained for review. Text markers represent actual lock names rather than substitute product imagery.
+- **Copy and content:** the disclosure, mode label and macro action follow the chosen design. Macro copy specifies keys rather than arbitrary actions. Detect, USB/firmware metadata, the accurate existing Secure Keyboard Entry section and update footer remain product requirements absent from the generated mock.
 
-## Required fidelity surfaces
+## Additional states and interactions
 
-- **Fonts and typography:** system SF typography, 18-point app title, 15-point device headings, 13-point controls, 12-point secondary text, and monospaced digits. Full and focused comparisons show readable labels without truncation.
-- **Spacing and layout:** one charcoal surface, 18-point horizontal insets, wide brightness controls, restrained separators, and a compact mouse disclosure. Expanded custom DPI has a full input and Apply button. Normal, single-device, empty, permission and update-error layouts were rendered.
-- **Colors and tokens:** graphite surface, white primary text, readable gray secondary text, pink/cyan accents, and yellow update state. Static lighting uses the selected color; other effects use a device-identification accent rather than claiming a live hardware color.
-- **Image and asset quality:** native SF Symbols provide icons; native controls retain interaction and accessibility. No screenshot is embedded as functioning UI. Offscreen text backing is recorded above; real Retina sharpness is not claimed.
-- **Copy and content:** firmware metadata no longer leaks into device names and remains in tooltips. Existing effects, read-back performance values, custom DPI, polling and scroll remain. Color wells appear only for Static. Updates and errors occupy the footer and reflect runtime state.
+- [Unavailable controls](docs/design/keyboard-indicators/unavailable.png): recording and the mode switch are disabled, with retry guidance; readable lock states remain shown.
+- [Mode confirmation failure](docs/design/keyboard-indicators/mode-error.png): an inline orange message appears, with no fabricated confirmed state.
+- Automated checks exercise expansion state, native recording/stop/Escape/focus loss, secure-input rejection, balanced storage, cancelled playback/key releases, pending indicator acquisition/cleanup and retry. They use fakes.
+- The native disclosure exposes its expanded/collapsed value, indicators expose names and On/Off/Unknown states, and switches/buttons retain native accessibility semantics. VoiceOver and real focus/navigation remain manual checks.
 
-## Validation
+## Validation and remaining checks
 
-- `bash tests/check-widget.sh`: passed with a temporary CLI stub and offscreen controls, without device access. Covers status metadata, error values containing equals signs, RGB arguments for Static, immediate color-state publication, color-write debounce, device action dispatch, slider release commits, keyboard/accessibility action paths, and native effect-menu selection.
-- `WIDGET_APP=<review-directory>/RazerCtl.app ./build-widget.sh`: passed, including core/GUI integrity and Developer ID signing.
-- `codesign --verify --strict`: passed with the installed copy's bundle identifier and signing team.
-- ZIP integrity and `git diff --check`: passed.
-- Additional rendered states: [Spectrum](docs/design/lighting-first/spectrum.png), [empty](docs/design/lighting-first/empty.png), [mouse only](docs/design/lighting-first/mouse.png), [permission denied](docs/design/lighting-first/permission.png), and [update failure](docs/design/lighting-first/update-error.png). Permission grants and update installation were not activated.
+`cargo test` passed 20 tests. The native widget regression suite and isolated
+Developer ID signed app build passed; strict bundle verification passed.
+Clippy is unavailable in the installed Rust toolchain. The compiler's
+`onChange` deprecation warning comes from retaining the API compatible with
+the app's macOS 12 minimum.
 
-## Remaining checks
-
-- User check: actual popover expansion, native menu/color-panel interaction, keyboard navigation/VoiceOver, and physical keyboard/mouse effects and read-back values. Offscreen rendering and isolated action tests do not verify these.
-- [P3] The native slider track is slightly thinner than the mockup, and the surface uses a solid color rather than texture. These do not change hierarchy or core use.
+Read-only hardware discovery confirmed inactive M/Gaming states and capability
+availability on the exact connected Ornata V3 X. It did not test mode writes,
+lamp transitions or Command-key suppression. Adrian should check the live
+popover, scrolling, native keyboard navigation/VoiceOver, M during record/stop,
+Gaming Mode and harmless macro replay before merging.

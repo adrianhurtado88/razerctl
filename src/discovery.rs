@@ -16,6 +16,8 @@ pub struct Capabilities {
     pub poll_rates: Vec<u16>,
     pub scroll: bool,
     pub zones: usize,
+    pub gaming_mode: bool,
+    pub macro_indicator: bool,
 }
 
 impl Capabilities {
@@ -33,6 +35,8 @@ impl Capabilities {
             },
             scroll: p.scroll,
             zones: p.zones,
+            gaming_mode: crate::keyboard::supported(p),
+            macro_indicator: crate::keyboard::supported(p),
         }
     }
 
@@ -52,6 +56,8 @@ impl Capabilities {
             self.poll_rates.clear();
         }
         self.scroll &= settings.contains_key("scroll");
+        self.gaming_mode &= settings.contains_key("gaming_mode");
+        self.macro_indicator &= settings.contains_key("macro_recording");
     }
 }
 

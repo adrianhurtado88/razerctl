@@ -70,13 +70,14 @@ struct KeyChord: Codable, Equatable, Hashable {
 }
 
 enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
-    case sendShortcut, openApplication, openWebsite
+    case sendShortcut, openApplication, openWebsite, playMacro
     var id: String { rawValue }
     var title: String {
         switch self {
         case .sendShortcut: return "Send a shortcut"
         case .openApplication: return "Open an app"
         case .openWebsite: return "Open a website"
+        case .playMacro: return "Play a macro"
         }
     }
 }
@@ -89,6 +90,7 @@ struct KeyboardShortcutRule: Codable, Identifiable, Equatable {
     var output: KeyChord?
     var destination = ""
     var enabled = true
+    var macro: [MacroKeyEvent]? = nil
 
     var summary: String {
         switch action {
@@ -96,6 +98,7 @@ struct KeyboardShortcutRule: Codable, Identifiable, Equatable {
         case .openApplication:
             return URL(fileURLWithPath: destination).deletingPathExtension().lastPathComponent
         case .openWebsite: return destination
+        case .playMacro: return "\((macro?.count ?? 0) / 2) recorded keys"
         }
     }
 
@@ -115,15 +118,20 @@ struct KeyboardShortcutRule: Codable, Identifiable, Equatable {
             throw ShortcutFailure("That key combination already has an assignment.")
         }
         try validateAction(rule)
-        if rule.enabled, rule.action == .sendShortcut, let output = rule.output,
-           ([rule] + others).contains(where: { $0.trigger?.matches(output) == true }) {
+        if rule.enabled && rule.outputs.contains(where: { output in
+            ([rule] + others).contains(where: { $0.trigger?.matches(output) == true })
+        }) {
             throw ShortcutFailure("The output cannot trigger another assignment, including itself.")
         }
-        if rule.enabled && others.contains(where: {
-            $0.action == .sendShortcut && $0.output?.matches(trigger) == true
-        }) {
+        if rule.enabled && others.contains(where: { $0.outputs.contains(where: { $0.matches(trigger) }) }) {
             throw ShortcutFailure("Another assignment sends that combination; choose a different trigger.")
         }
+    }
+
+    var outputs: [KeyChord] {
+        if action == .sendShortcut { return output.map { [$0] } ?? [] }
+        if action == .playMacro { return (macro ?? []).filter(\.down).map(\.chord) }
+        return []
     }
 
     static func validateAction(_ rule: Self) throws {
@@ -132,6 +140,8 @@ struct KeyboardShortcutRule: Codable, Identifiable, Equatable {
             guard let output = rule.output, output.validKey else {
                 throw ShortcutFailure("Record the shortcut you want to send.")
             }
+        case .playMacro:
+            try KeyboardMacro.validate(rule.macro ?? [])
         case .openApplication:
             guard rule.destination.hasPrefix("/"), rule.destination.hasSuffix(".app"),
                   FileManager.default.fileExists(atPath: rule.destination) else {
@@ -249,12 +259,14 @@ protocol ShortcutActionRunning: AnyObject {
 final class MacShortcutActionRunner: ShortcutActionRunning {
     private var pending: DispatchWorkItem?
     private var generation = UUID()
+    private var macroPlayer: MacroPlayer?
     var accessibilityGranted: Bool { AXIsProcessTrusted() }
 
     func cancel() {
         pending?.cancel()
         pending = nil
         generation = UUID()
+        macroPlayer?.cancel(); macroPlayer = nil
     }
 
     func run(_ rule: KeyboardShortcutRule, completion: @escaping (String?) -> Void) {
@@ -276,6 +288,11 @@ final class MacShortcutActionRunner: ShortcutActionRunning {
                 return
             }
             completion(nil)
+        case .playMacro:
+            do { try KeyboardMacro.validate(rule.macro ?? []) }
+            catch { completion(error.localizedDescription); return }
+            let target = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            playAfterRelease(rule.macro ?? [], target: target, deadline: Date().addingTimeInterval(3), completion: completion)
         case .sendShortcut:
             guard accessibilityGranted else {
                 completion("Allow RazerCtl in System Settings → Privacy & Security → Accessibility to send shortcuts.")
@@ -286,6 +303,41 @@ final class MacShortcutActionRunner: ShortcutActionRunning {
             sendAfterRelease(output, target: target, deadline: Date().addingTimeInterval(3),
                              completion: completion)
         }
+    }
+
+    private func playAfterRelease(_ events: [MacroKeyEvent], target: pid_t?, deadline: Date,
+                                  completion: @escaping (String?) -> Void) {
+        let ready: () -> String? = {
+            if !AXIsProcessTrusted() { return "Accessibility access is required to play macros." }
+            if IsSecureEventInputEnabled() { return "Turn off Secure Keyboard Entry before playing a macro." }
+            if target == nil || NSWorkspace.shared.frontmostApplication?.processIdentifier != target {
+                return "Macro cancelled because the active app changed."
+            }
+            return nil
+        }
+        if let error = ready() { completion(error); return }
+        let held = CGEventSource.flagsState(.hidSystemState)
+            .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
+        if !held.isEmpty {
+            guard Date() < deadline else { completion("Release the modifier keys and try again."); return }
+            let token = generation
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.generation == token else { return }
+                self.playAfterRelease(events, target: target, deadline: deadline, completion: completion)
+            }
+            pending = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: work)
+            return
+        }
+        let player = MacroPlayer(ready: ready, emit: { event in
+            guard let source = CGEventSource(stateID: .privateState),
+                  let key = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(event.chord.keyCode), keyDown: event.down) else { return false }
+            key.flags = event.chord.eventFlags
+            key.post(tap: .cghidEventTap)
+            return true
+        })
+        macroPlayer = player
+        player.play(events, completion: completion)
     }
 
     // Wait for physical modifiers to be released, so a held trigger modifier
@@ -441,6 +493,8 @@ final class KeyboardShortcutsStore: ObservableObject {
         if let data = try? JSONEncoder().encode(rules) { defaults.set(data, forKey: rulesKey) }
     }
 
+    func cancelActions() { runner.cancel() }
+
     func refreshAccess() { accessibilityGranted = runner.accessibilityGranted }
 
     func requestAccessibility() {
@@ -552,12 +606,16 @@ final class ShortcutRecorderButton: NSButton {
 struct KeyboardShortcutsButton: View {
     @ObservedObject var shortcuts: KeyboardShortcutsStore
     let openEditor: () -> Void
+    var title = "Customise shortcuts…"
+    var showsIcon = true
+    var prominent = false
 
     var body: some View {
         Button(action: openEditor) {
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
-                    Label("Customise shortcuts…", systemImage: "command")
+                    if showsIcon { Image(systemName: "command") }
+                    Text(title)
                     Spacer()
                     Image(systemName: "chevron.right").font(.caption)
                 }
@@ -568,21 +626,21 @@ struct KeyboardShortcutsButton: View {
             }
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(prominent ? .primary : .secondary)
         .padding(.top, 4)
     }
 }
 
 final class KeyboardShortcutsWindow: NSWindowController, NSWindowDelegate {
-    init(store: KeyboardShortcutsStore) {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 550),
+    init(store: KeyboardShortcutsStore, indicators: KeyboardControlsStore? = nil, createMacro: Bool = false) {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 620),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
         super.init(window: window)
         window.title = "Keyboard Shortcuts"
-        window.minSize = NSSize(width: 660, height: 500)
+        window.minSize = NSSize(width: 660, height: 600)
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: KeyboardShortcutsView(store: store))
+        window.contentView = NSHostingView(rootView: KeyboardShortcutsView(store: store, indicators: indicators, createMacro: createMacro))
         window.appearance = NSAppearance(named: .darkAqua)
         window.delegate = self
         window.center()
@@ -603,6 +661,14 @@ private struct KeyboardShortcutsView: View {
     @State private var draft = KeyboardShortcutRule()
     @State private var editing = false
     @State private var error: String?
+    let indicators: KeyboardControlsStore?
+    init(store: KeyboardShortcutsStore, indicators: KeyboardControlsStore?, createMacro: Bool) {
+        self.store = store; self.indicators = indicators
+        var rule = KeyboardShortcutRule()
+        if createMacro { rule.action = .playMacro }
+        _draft = State(initialValue: rule)
+        _editing = State(initialValue: createMacro)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -714,7 +780,7 @@ private struct KeyboardShortcutsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             ShortcutActionFields(rule: $draft, accessibilityGranted: store.accessibilityGranted,
-                                 requestAccess: store.requestAccessibility, recordingChanged: store.setRecording)
+                                 requestAccess: store.requestAccessibility, recordingChanged: store.setRecording, indicators: indicators)
             Toggle("Enabled", isOn: $draft.enabled)
             if let error { Text(error).font(.callout).foregroundStyle(.orange) }
             HStack {
@@ -752,11 +818,13 @@ struct ShortcutActionFields: View {
     let accessibilityGranted: Bool
     let requestAccess: () -> Void
     let recordingChanged: (Bool) -> Void
+    var indicators: KeyboardControlsStore? = nil
+    var allowsMacros = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("Do this", selection: $rule.action) {
-                ForEach(ShortcutAction.allCases) { action in Text(action.title).tag(action) }
+                ForEach(ShortcutAction.allCases.filter { allowsMacros || $0 != .playMacro }) { action in Text(action.title).tag(action) }
             }
             switch rule.action {
             case .sendShortcut:
@@ -765,6 +833,17 @@ struct ShortcutActionFields: View {
                 if !accessibilityGranted {
                     Text("Sending shortcuts needs Accessibility access.")
                         .font(.caption).foregroundStyle(.secondary)
+                    Button("Allow Accessibility…", action: requestAccess)
+                }
+            case .playMacro:
+                MacroRecorder(events: $rule.macro, recordingChanged: recordingChanged, indicators: indicators)
+                    .frame(height: 28)
+                Text(rule.macro == nil ? "Keys are captured only here. Click again to stop; Esc cancels. 60-second limit." : "\((rule.macro?.count ?? 0) / 2) keys recorded. Save with a trigger to replay in the active app.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Macros are saved on this Mac. Avoid recording passwords.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !accessibilityGranted {
+                    Text("Playing macros needs Accessibility access.").font(.caption).foregroundStyle(.secondary)
                     Button("Allow Accessibility…", action: requestAccess)
                 }
             case .openApplication:
