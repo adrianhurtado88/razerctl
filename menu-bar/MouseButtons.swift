@@ -654,7 +654,7 @@ private struct MouseButtonsView: View {
             }
             ShortcutActionFields(rule: $draft.assignment, accessibilityGranted: store.accessibilityGranted,
                                  requestAccess: store.requestAccessibility,
-                                 recordingChanged: store.setOutputRecording)
+                                 recordingChanged: store.setOutputRecording, allowsMacros: false)
             Toggle("Enabled", isOn: $draft.assignment.enabled)
             if let error { Text(error).font(.callout).foregroundStyle(.orange) }
             HStack {
